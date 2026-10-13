@@ -1,15 +1,24 @@
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 
-const connection = new IORedis(process.env.REDIS_URL || "redis://localhost:6379", {
-  maxRetriesPerRequest: null,
-});
+export const QUEUE_NAME = "item-events";
 
-export const itemQueue = new Queue("item-events", { connection });
+// BullMQ needs maxRetriesPerRequest: null on its connection.
+export function createRedisConnection(redisUrl, opts = {}) {
+  return new IORedis(redisUrl, { maxRetriesPerRequest: null, ...opts });
+}
 
-export async function enqueueItemCreated(item) {
-  await itemQueue.add("item-created", item, {
-    removeOnComplete: 100,
-    removeOnFail: 100,
-  });
+export function createQueue(connection) {
+  const queue = new Queue(QUEUE_NAME, { connection });
+  return {
+    async enqueueItemCreated(item) {
+      await queue.add("item-created", item, {
+        attempts: 5,
+        backoff: { type: "exponential", delay: 1000 },
+        removeOnComplete: 100,
+        removeOnFail: 500,
+      });
+    },
+    close: () => queue.close(),
+  };
 }

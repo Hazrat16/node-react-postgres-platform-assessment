@@ -1,59 +1,65 @@
 import pg from "pg";
+import { log } from "./logger.js";
 
 const { Pool } = pg;
 
-function buildConnectionString() {
-  const {
-    DB_USER = "appuser",
-    DB_PASSWORD = "apppass",
-    DB_HOST = "localhost",
-    DB_PORT = "5432",
-    DB_NAME = "appdb",
-  } = process.env;
-  return `postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}`;
+// Connection-level failures (replica down, DNS, timeouts, admin shutdown) as
+// opposed to query errors like a syntax error, which must not be retried.
+function isConnectionError(err) {
+  return (
+    ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "ECONNRESET"].includes(err.code) ||
+    /^(08|57P0)/.test(err.code || "") ||
+    /timeout|terminated/i.test(err.message)
+  );
 }
 
-// Simulated read/write DB cluster: two pools pointed at different env vars.
-// Locally both usually resolve to the same Postgres instance, but the app
-// already treats reads and writes as separate targets, so pointing
-// DB_READ_URL at a real replica later is a config-only change - no code edits.
-const writePool = new Pool({
-  connectionString: process.env.DB_WRITE_URL || buildConnectionString(),
-});
+// Read/write split: two pools pointed at different URLs. DB_WRITE_URL is the
+// primary, DB_READ_URL a streaming replica. The routing decision lives here,
+// in application code: callers pick write() or read() explicitly.
+export function createDb({ dbWriteUrl, dbReadUrl }) {
+  const writePool = new Pool({ connectionString: dbWriteUrl, max: 10 });
+  const readPool = new Pool({ connectionString: dbReadUrl, max: 10 });
 
-const readPool = new Pool({
-  connectionString:
-    process.env.DB_READ_URL || process.env.DB_WRITE_URL || buildConnectionString(),
-});
+  for (const [name, pool] of [["write", writePool], ["read", readPool]]) {
+    pool.on("error", (err) => log.error("idle pg client error", { pool: name, error: err.message }));
+  }
 
-export async function initSchema() {
-  await writePool.query(`
-    CREATE TABLE IF NOT EXISTS items (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-}
+  return {
+    async initSchema() {
+      await writePool.query(`
+        CREATE TABLE IF NOT EXISTS items (
+          id SERIAL PRIMARY KEY,
+          name TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+      `);
+    },
 
-// All INSERT/UPDATE/DELETE statements must go through write() -> writePool,
-// which in a real cluster points at the primary.
-export function write(query, params) {
-  return writePool.query(query, params);
-}
+    // INSERT/UPDATE/DELETE, and any read that must see the caller's own
+    // latest write, go to the primary.
+    write(query, params) {
+      return writePool.query(query, params);
+    },
 
-// SELECTs can be served from read() -> readPool, which in a real cluster
-// points at a replica. Anything that just read its own write (e.g. a
-// "did my update succeed" check right after a write) should still use
-// write()/writePool to avoid replication-lag surprises.
-export function read(query, params) {
-  return readPool.query(query, params);
-}
+    // Plain SELECTs go to the replica. If the replica is unreachable we fall
+    // back to the primary: slightly more load on the writer beats failing
+    // the request.
+    async read(query, params) {
+      try {
+        return await readPool.query(query, params);
+      } catch (err) {
+        if (!isConnectionError(err)) throw err;
+        log.warn("read replica unavailable, falling back to primary", { error: err.message });
+        return writePool.query(query, params);
+      }
+    },
 
-export async function pingWrite() {
-  await writePool.query("SELECT 1");
-}
+    async pingWrite() {
+      await writePool.query("SELECT 1");
+    },
 
-export async function pingRead() {
-  await readPool.query("SELECT 1");
+    async close() {
+      await Promise.all([writePool.end(), readPool.end()]);
+    },
+  };
 }
