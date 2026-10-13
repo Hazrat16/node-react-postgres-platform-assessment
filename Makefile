@@ -60,7 +60,11 @@ images: ## Build images and load them into kind
 	kind load docker-image node-react-backend:local node-react-frontend:local --name $(CLUSTER)
 
 deploy: secrets ## Apply the $(ENV) overlay and wait for rollouts
-	kubectl apply --server-side --force-conflicts -k $(OVERLAY)
+	@# Ingress objects are validated by the ingress-nginx admission webhook, which
+	@# can still be starting right after `make cluster` - wait for it, then retry.
+	kubectl -n ingress-nginx wait --for=condition=ready pod -l app.kubernetes.io/component=controller --timeout=300s
+	for i in 1 2 3 4 5; do kubectl apply --server-side --force-conflicts -k $(OVERLAY) && break; \
+	  [ $$i = 5 ] && exit 1; echo "apply failed (attempt $$i), retrying in 10s"; sleep 10; done
 	kubectl -n $(ENV) rollout status statefulset/postgres --timeout=180s
 	kubectl -n $(ENV) rollout status statefulset/postgres-replica --timeout=300s
 	kubectl -n $(ENV) rollout status deployment/backend --timeout=180s
