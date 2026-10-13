@@ -22,7 +22,8 @@ resources:
   - postgres-service.yaml
   - postgres-pvc.yaml
 
-# Image names are placeholders for locally built images (`make images`).
+# Image names are placeholders for locally built images; CI pins them per
+# overlay to ghcr.io/...:<branch>-<sha> (see .github/workflows/ci-cd.yml).
 images:
   - name: node-react-backend
     newTag: local

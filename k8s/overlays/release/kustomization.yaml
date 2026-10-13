@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: release
+
+resources:
+  - namespace-release.yaml
+  - ../../base
+  - postgres-pv.yaml
+  - ingress-release.yaml
+
+labels:
+  - pairs:
+      environment: release
+    includeSelectors: false
+
+# Built from the git-ignored secrets.env. The generated name carries a
+# content hash, so changing a secret automatically rolls the pods.
+secretGenerator:
+  - name: app-secrets
+    envs:
+      - secrets.env

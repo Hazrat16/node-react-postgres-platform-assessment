@@ -1,6 +1,6 @@
 # ingress-nginx tuned for kind: runs on the control-plane node (label
 # ingress-ready=true) and binds host ports 80/443, which kind maps to the
-# host machine.
+# host machine. Also used by CI.
 controller:
   hostPort:
     enabled: true

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: release
+  labels:
+    environment: release
+    # Pod Security Admission: enforce "baseline" (the Postgres image needs
+    # it), and warn about anything that isn't "restricted".
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
