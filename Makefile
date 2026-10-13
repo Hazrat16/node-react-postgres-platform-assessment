@@ -4,8 +4,10 @@ SHELL := /bin/bash
 ENV ?= dev
 CLUSTER ?= node-react
 OVERLAY := k8s/overlays/$(ENV)
+# Host port for the Ingress (use e.g. HTTP_PORT=8880 if something already listens on 80)
+HTTP_PORT ?= 80
 
-.PHONY: help env up down logs test cluster-kind cluster-destroy secrets images deploy status
+.PHONY: help env up down logs test cluster cluster-kind cluster-destroy secrets images deploy k8s-up hosts status
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -31,12 +33,18 @@ test: ## Run backend tests + frontend build
 	cd backend && npm ci && npm run lint && npm test
 	cd frontend && npm ci && npm run build
 
-# ---- Kubernetes (Task 2) -----------------------------------------------------
-cluster-kind: ## Create the 3-node kind cluster
+# ---- Kubernetes (Tasks 2-6) --------------------------------------------------
+cluster: ## Create kind cluster + ingress-nginx (Terraform)
+	terraform -chdir=terraform init -upgrade
+	terraform -chdir=terraform apply -auto-approve -var ingress_http_port=$(HTTP_PORT)
+
+cluster-kind: ## Alternative without Terraform: plain kind + ingress-nginx
 	kind create cluster --config k8s/kind-config.yaml
+	helm upgrade --install ingress-nginx ingress-nginx --repo https://kubernetes.github.io/ingress-nginx \
+	  --version 4.15.1 -n ingress-nginx --create-namespace -f terraform/values/ingress-nginx.yaml --wait
 
 cluster-destroy: ## Delete the cluster
-	kind delete cluster --name $(CLUSTER)
+	terraform -chdir=terraform destroy -auto-approve || kind delete cluster --name $(CLUSTER)
 
 secrets: ## Generate k8s/overlays/$(ENV)/secrets.env with random passwords (if missing)
 	@test -f $(OVERLAY)/secrets.env || { \
@@ -54,5 +62,11 @@ deploy: secrets ## Apply the $(ENV) overlay and wait for rollouts
 	kubectl -n $(ENV) rollout status deployment/backend --timeout=180s
 	kubectl -n $(ENV) rollout status deployment/frontend --timeout=120s
 
+k8s-up: cluster images deploy hosts ## Everything: cluster + ingress + app in dev
+
+hosts: ## Print the /etc/hosts line needed for the Ingress hostnames
+	@echo "Add this to /etc/hosts (once):"
+	@echo "127.0.0.1 node-react.local"
+
 status: ## kubectl get all in $(ENV)
-	kubectl get all,pvc -n $(ENV)
+	kubectl get all,ingress,pvc -n $(ENV)

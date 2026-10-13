@@ -11,8 +11,9 @@ end shows what is done and what comes next.
 3. [Repository layout](#repository-layout)
 4. [Task 1 — Docker Compose](#task-1--docker-compose)
 5. [Task 2 — Kubernetes](#task-2--kubernetes)
-6. [Design decisions & trade-offs](#design-decisions--trade-offs)
-7. [Roadmap](#roadmap)
+6. [Task 3 — Ingress as API gateway](#task-3--ingress-as-api-gateway)
+7. [Design decisions & trade-offs](#design-decisions--trade-offs)
+8. [Roadmap](#roadmap)
 
 ---
 
@@ -23,6 +24,8 @@ end shows what is done and what comes next.
 | Docker (+ Compose v2) | 29.x / Compose 5.x | everything |
 | kind | 0.31 | Kubernetes |
 | kubectl | 1.35 | Kubernetes |
+| Terraform | ≥ 1.6 (tested 1.16) | cluster + platform add-ons |
+| Helm | 3 or 4 | only for `make cluster-kind` (no-Terraform path) |
 | Node.js | 24 | only to run tests outside Docker |
 
 Resources: Compose needs ~1 GB RAM; the Kubernetes setup needs ~3 GB free RAM.
@@ -39,16 +42,28 @@ docker compose up --build     # or `make up`
 - UI: http://localhost:8080
 - API (debug only, bound to 127.0.0.1): http://localhost:4000/api/health
 
-### Kubernetes (Task 2)
+### Kubernetes (Tasks 2–3)
 
 ```bash
-make cluster-kind   # kind create cluster --config k8s/kind-config.yaml (3 nodes)
-make images         # build both images and `kind load` them into the cluster
-make deploy         # generate k8s/overlays/dev/secrets.env, kubectl apply -k, wait for rollouts
+make k8s-up
+# = terraform apply (kind cluster + ingress-nginx)
+#   + build images and `kind load` them
+#   + generate k8s/overlays/dev/secrets.env with random passwords
+#   + kubectl apply -k k8s/overlays/dev and wait for rollouts
+
+# once: map the Ingress hostnames to localhost
+echo "127.0.0.1 node-react.local" | sudo tee -a /etc/hosts
 ```
 
-- UI: http://localhost:30080 (frontend `NodePort`, mapped to the host by kind)
-- `make status` = `kubectl get all,pvc -n dev`
+| URL | What |
+|---|---|
+| http://node-react.local | the app (frontend + `/api`) |
+
+> **Port 80 already in use** (e.g. a local nginx/apache)? Either stop it, or create the cluster
+> on another port: `make k8s-up HTTP_PORT=8880` and use `http://node-react.local:8880`.
+
+Other useful targets: `make help`, `make status`,
+`make cluster-destroy`.
 
 ## Repository layout
 
@@ -65,7 +80,8 @@ make deploy         # generate k8s/overlays/dev/secrets.env, kubectl apply -k, w
 ├── k8s/
 │   ├── kind-config.yaml        3-node kind cluster
 │   ├── base/                   environment-agnostic manifests (kustomize base)
-│   ├── overlays/dev/           namespace, PV, secrets
+│   ├── overlays/dev/           namespace, PV, Ingress, secrets
+├── terraform/                  kind cluster + ingress-nginx (Helm)
 ```
 
 Mapping from the file names suggested in the brief to this repo:
@@ -79,6 +95,7 @@ Mapping from the file names suggested in the brief to this repo:
 | `postgres-pv.yaml` / `postgres-pvc.yaml` | `k8s/overlays/<env>/` / `k8s/base/` | PV is cluster-scoped, so one per env |
 | `app-configmap.yaml` | `k8s/base/app-configmap.yaml` | |
 | `app-secrets.yaml` | `secretGenerator` in `k8s/overlays/<env>/kustomization.yaml` | built from a git-ignored `secrets.env` — see [Task 2](#task-2--kubernetes) |
+| `ingress-dev.yaml` | `k8s/overlays/dev/ingress-dev.yaml` | |
 
 ---
 
@@ -142,6 +159,7 @@ be deployed to every namespace and only the differences live in the overlays:
 
 - namespace
 - Postgres PV
+- Ingress hostname
 - secrets
 
 ```bash
@@ -149,11 +167,13 @@ kubectl apply --server-side --force-conflicts -k k8s/overlays/dev   # what `make
 kubectl get all -n dev
 ```
 
-**Internal vs external.** `backend-service` and `postgres-service` are `ClusterIP`: reachable
-only inside the cluster. `frontend-service` is a `NodePort` (30080), and kind maps that port
-to the host, so the UI is at http://localhost:30080. The frontend's nginx proxies `/api` to
-`backend-service`, so the backend never needs to be exposed. (Task 3 replaces the NodePort
-with an Ingress.)
+**Internal vs external.** Every Service is `ClusterIP`:
+
+- `backend-service`
+- `frontend-service`
+- `postgres-service`
+
+The only way in from outside the cluster is the Ingress controller (Task 3).
 
 **Postgres** is a `StatefulSet` (stable identity, at most one pod on the volume), with
 `PGDATA` in a subdirectory of the volume:
@@ -199,15 +219,129 @@ carries a content hash, so changing a password rolls the pods that use it.
 
 ---
 
+## Task 3 — Ingress as API gateway
+
+`ingress-nginx` (Helm, installed by Terraform) runs on the kind control-plane node. It binds
+host ports 80/443, which `kind` maps to the laptop. `k8s/overlays/dev/ingress-dev.yaml` defines
+two Ingress objects on host `node-react.local`:
+
+| Path | Backend | Policy |
+|---|---|---|
+| `/` (Prefix) | `frontend-service:80` | none |
+| `/api` (Prefix, matches `/api` and `/api/*`) | `backend-service:4000` | body size, timeouts |
+
+They're split in two so API-only policy (body size, timeouts) doesn't apply
+to static assets. The longest-prefix match means `/api/...` always wins over `/`.
+
+**Terraform** (`terraform/`) now owns the cluster: the `tehcyx/kind` provider creates the same
+3-node cluster as `k8s/kind-config.yaml`, and the `helm` provider installs ingress-nginx from a
+pinned chart version. The app itself is not managed by Terraform; it is deployed with kustomize
+(`make deploy`).
+
+### Request path: Browser → Ingress → Service → Pod → PostgreSQL
+
+Example: `POST http://node-react.local/api/items`
+
+1. **Browser → node.** `/etc/hosts` resolves `node-react.local` to `127.0.0.1`. Port 80 on the
+   laptop is mapped by kind to port 80 of the control-plane node container, where the
+   ingress-nginx pod listens via `hostPort`. (In the cloud this hop is DNS → a cloud load
+   balancer → the controller's Service.)
+2. **Ingress controller.** nginx matches `Host: node-react.local` and the longest path prefix
+   `/api`, and picks an upstream. ingress-nginx doesn't go through
+   the Service's virtual IP. It watches the Service's **EndpointSlices** and load-balances
+   straight to the **ready** pod IPs.
+3. **Service.** `backend-service` is a stable name + virtual IP whose selector `app=backend`
+   defines the endpoint set. Only pods passing readiness are included. Any in-cluster client
+   (e.g. the frontend's nginx proxy) uses the ClusterIP, which kube-proxy rules (iptables)
+   DNAT to one of those pod IPs.
+4. **Pod.** The Express app handles the request and writes with `INSERT … RETURNING` to
+   `postgres-service:5432`.
+5. **PostgreSQL.** `postgres-service` → `postgres-0`, whose data lives on the PersistentVolume.
+
+### How Kubernetes DNS resolves services
+
+- CoreDNS gives every Service an A record `<service>.<namespace>.svc.cluster.local` pointing at
+  its ClusterIP, e.g. `backend-service.dev.svc.cluster.local`.
+- Each pod's `/etc/resolv.conf` has `search dev.svc.cluster.local svc.cluster.local
+  cluster.local` and `ndots:5`. So inside the `dev` namespace the short name `backend-service`
+  resolves; from another namespace you need `backend-service.dev` (or the FQDN).
+- That is why the same manifests work unchanged in every environment namespace: each
+  environment's `postgres-service` resolves to its own namespace's database.
+- Pods use these names, never pod IPs, because pod IPs change on every reschedule.
+- Headless services (`clusterIP: None`) would return the pod IPs instead (StatefulSet per-pod
+  DNS).
+
+### Debugging
+
+**(a) Ingress is reachable but the backend is not** (UI loads, `/api/*` gives 502/503/504):
+
+```bash
+kubectl -n dev get ingress api-ingress                  # host/path/backend as expected? ADDRESS set?
+kubectl -n dev describe ingress api-ingress             # events: "service not found"?
+kubectl -n dev get endpointslices -l kubernetes.io/service-name=backend-service
+#   empty -> selector doesn't match pod labels, or no pod is Ready:
+kubectl -n dev get pods -l app=backend                  # Running but 0/1 = failing readiness
+kubectl -n dev describe pod <backend-pod>               # probe failures, OOMKilled, image pull
+kubectl -n dev logs <backend-pod>                       # e.g. "database not ready, retrying"
+kubectl -n dev get svc backend-service -o yaml          # port/targetPort name matches containerPort?
+kubectl -n ingress-nginx logs deploy/ingress-nginx-controller | grep '/api'    # upstream status
+```
+
+How to read the status code:
+
+- `503` with no endpoints → readiness / selector problem
+- `502` → the pod is in the endpoint list but refused the connection (wrong port, app crashed)
+- `504` → the app is too slow (often the DB)
+
+**(b) The frontend can't talk to the backend:**
+
+1. Browser dev tools → Network. Which URL is called? It must be same-origin `/api/...`.
+   - If it's `http://backend-service:4000/...` or `localhost:4000`, the wrong
+     `VITE_API_BASE_URL` was baked in at build time: rebuild the image. Internal DNS names
+     never resolve in a browser.
+   - If it's `/api/...` and the response is `index.html` with status 200, the request hit the
+     frontend instead of the API: the `/api` Ingress rule is missing or the path is wrong.
+2. Call the API directly, bypassing the UI:
+   `curl -i http://node-react.local/api/health`. If that fails, go to (a).
+3. In-cluster path (the frontend's nginx proxy):
+   `kubectl -n dev exec deploy/frontend -- wget -qO- http://127.0.0.1:8080/api/health`.
+   - DNS: `kubectl -n dev exec deploy/backend -- getent hosts backend-service`
+   - `BACKEND_URL` env value
+4. CORS errors only appear if the UI and the API are on different origins. This design avoids
+   that entirely.
+
+### Evolving to microservices
+
+The Ingress is already a path-based API gateway. Splitting the backend means:
+
+- `/api/items` → `items-service`, `/api/search` → `search-api`, `/api/users` → `users-service`.
+  Each is its own Deployment + ClusterIP Service + HPA + NetworkPolicy, owned and deployed
+  independently.
+- Services call each other by DNS name, and talk asynchronously over a queue (BullMQ / Redis
+  in Task 5), which avoids synchronous call chains.
+- Each service owns its data. No shared tables. Integration happens through APIs and events.
+- At that scale I'd move from ingress-nginx annotations to a real gateway: the **Gateway API**
+  (`HTTPRoute` per team), with Envoy Gateway / Kong / Traefik. That brings per-route auth (JWT),
+  per-consumer rate limits, retries and canary weights. Add a **service mesh** (Linkerd/Istio)
+  only once mTLS between services, retries and per-hop tracing are actually needed.
+- Note: the ingress-nginx project was retired in March 2026 (no further releases). It's used
+  here because the brief suggests it and it still works. A real platform today should start on
+  the Gateway API.
+
+---
+
 ## Design decisions & trade-offs
 
 | Decision | Why | Trade-off |
 |---|---|---|
-| **Same-origin `/api`** (nginx proxy in Compose) | one image for all envs, no CORS, no internal hostnames in the browser | frontend nginx needs `BACKEND_URL` |
+| **Same-origin `/api`** (nginx proxy in Compose, Ingress in k8s) | one image for all envs, no CORS, no internal hostnames in the browser | frontend nginx needs `BACKEND_URL` |
 | **Fail fast on missing secrets, no defaults in code** | a misconfigured deploy fails at startup instead of connecting with a guessable password | local runs need a `.env` (`make env` generates one) |
 | **kustomize base + overlays** instead of `sed` on manifests | one source of truth, per-env diffs are small and reviewable | less flexible than Helm for third-party-style packaging |
 | **hostPath PV pinned to a labelled node** | satisfies the explicit PV/PVC requirement on kind | node-local storage: if that node dies, the data is gone until it returns. In the cloud use a CSI StorageClass (EBS/PD) and drop the static PV |
 | **Server-side apply** | the API server tracks field ownership | `--force-conflicts` makes the deploy tooling the owner of the fields it sets, so manual `kubectl edit` changes are overwritten on the next deploy (intended) |
+| **Terraform for cluster + platform add-ons, not the app** | infrastructure changes rarely and needs plan/apply; app releases happen many times a day via CI | `k8s/kind-config.yaml` (used by CI) and `terraform/main.tf` describe the same cluster and must be kept in sync |
+| **Helm for third-party, kustomize for our app** | upstream charts are maintained by their authors; our app is simple enough for plain YAML | two tools |
+| **ingress-nginx** | suggested by the brief, mature, simple annotations | project retired in 2026; Gateway API is the forward path |
 
 ## Roadmap
 
@@ -215,7 +349,7 @@ carries a content hash, so changing a password rolls the pods that use it.
 |---|---|
 | 1. Docker Compose | ✅ done |
 | 2. Kubernetes (dev namespace) | ✅ done |
-| 3. Ingress / API gateway + Terraform | planned |
+| 3. Ingress / API gateway + Terraform | ✅ done |
 | 4. CI/CD & multi-environment deployment | planned |
 | 5. Redis, queue, search, read/write DB | planned |
 | 6. Observability, autoscaling, rate limiting | planned |
