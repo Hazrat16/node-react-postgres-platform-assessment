@@ -2,5 +2,6 @@ node_modules/
 dist/
 *.log
 
-# Local secrets - never committed. See .env.example
+# Local secrets - never committed. See .env.example and k8s/overlays/*/secrets.env.example
 .env
+secrets.env
