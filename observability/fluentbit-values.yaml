@@ -1,0 +1,49 @@
+# Fluent Bit as a DaemonSet: one collector per node tails every container's
+# log file under /var/log/containers, enriches it with Kubernetes metadata
+# and ships it to Loki.
+kind: DaemonSet
+
+tolerations:
+  - operator: Exists # run on the control-plane too (ingress controller logs)
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+config:
+  inputs: |
+    [INPUT]
+        Name tail
+        Path /var/log/containers/*.log
+        Exclude_Path /var/log/containers/fluent-bit-*.log
+        multiline.parser docker, cri
+        Tag kube.*
+        Mem_Buf_Limit 10MB
+        Skip_Long_Lines On
+
+  filters: |
+    # Adds namespace/pod/container/labels. Merge_Log parses the JSON lines our
+    # backend and ingress write, so their fields become queryable.
+    [FILTER]
+        Name kubernetes
+        Match kube.*
+        Merge_Log On
+        Keep_Log Off
+        K8S-Logging.Parser On
+        K8S-Logging.Exclude On
+
+  outputs: |
+    # Low-cardinality labels only (namespace, app, container); everything
+    # else stays in the JSON line and is filtered with `| json` in LogQL.
+    [OUTPUT]
+        Name loki
+        Match kube.*
+        Host loki.logging.svc.cluster.local
+        Port 3100
+        Labels job=fluent-bit, namespace=$kubernetes['namespace_name'], app=$kubernetes['labels']['app'], container=$kubernetes['container_name']
+        Remove_Keys kubernetes, stream, _p
+        Line_Format json
+        Retry_Limit 5

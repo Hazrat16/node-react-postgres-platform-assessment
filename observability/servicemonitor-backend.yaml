@@ -1,0 +1,17 @@
+# Tells Prometheus to scrape /metrics on every backend-service, in every
+# environment namespace (dev, preprod, release).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: backend
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      app: backend
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
