@@ -694,6 +694,27 @@ limits should come from load tests and be per API key/user (at a gateway), not j
 
 ---
 
+## Evidence
+
+Captured from a cluster built with `make k8s-up` from this repo (`master`). All files are in
+[`docs/screenshots/`](docs/screenshots/); [`docs/README.md`](docs/README.md) says how to reproduce each.
+
+| What | Screenshot |
+|---|---|
+| Passing pipeline on `master` (test → validate → build/scan/push → deploy + smoke test) | [github-actions-run.png](docs/screenshots/github-actions-run.png) |
+| `kubectl get all,ingress,pvc,hpa -n dev` during the load test (6/6 backend pods) | [kubectl-get-all-dev.png](docs/screenshots/kubectl-get-all-dev.png) |
+| The app at http://node-react.local (items + OpenSearch search) | [app-node-react-local.png](docs/screenshots/app-node-react-local.png) |
+| Reads served by the streaming replica (`/api/health/db`) | [api-health-db.png](docs/screenshots/api-health-db.png) |
+| Grafana dashboard: CPU, memory, request/error rate, replicas, latency | [grafana-backend-dashboard.png](docs/screenshots/grafana-backend-dashboard.png) |
+| HPA at max replicas under load | [hpa-scaling.png](docs/screenshots/hpa-scaling.png) |
+| Ingress rate limiting: 105 × 200 / 195 × 429 | [rate-limit-429.png](docs/screenshots/rate-limit-429.png) |
+| Prometheus alert rules (`BackendHPAAtMaxReplicas` pending during the load test) | [prometheus-alerts.png](docs/screenshots/prometheus-alerts.png) |
+| Loki: backend request logs filtered with LogQL | [loki-query.png](docs/screenshots/loki-query.png) |
+
+![Grafana backend dashboard during the load test](docs/screenshots/grafana-backend-dashboard.png)
+
+---
+
 ## Design decisions & trade-offs
 
 | Decision | Why | Trade-off |
