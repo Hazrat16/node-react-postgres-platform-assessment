@@ -9,6 +9,7 @@ const enqueued = [];
 const fakes = {
   db: {
     pingWrite: async () => {},
+    replicaStatus: async () => ({ in_recovery: true, lag_seconds: "0.2" }),
     read: async () => ({ rows: [...items].reverse() }),
     write: async (_sql, [name]) => {
       const item = { id: items.length + 1, name, created_at: new Date().toISOString() };
@@ -20,6 +21,7 @@ const fakes = {
   queue: { enqueueItemCreated: async (item) => enqueued.push(item) },
   search: {
     health: async () => ({ status: "green" }),
+    searchItems: async (q) => items.filter((i) => i.name.includes(q)),
   },
 };
 

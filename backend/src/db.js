@@ -58,6 +58,16 @@ export function createDb({ dbWriteUrl, dbReadUrl }) {
       await writePool.query("SELECT 1");
     },
 
+    // Reports whether the read pool is really a replica and how far behind
+    // the primary it is.
+    async replicaStatus() {
+      const { rows } = await readPool.query(`
+        SELECT pg_is_in_recovery() AS in_recovery,
+               EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) AS lag_seconds
+      `);
+      return rows[0];
+    },
+
     async close() {
       await Promise.all([writePool.end(), readPool.end()]);
     },
