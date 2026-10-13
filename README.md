@@ -1,8 +1,32 @@
 # Node + React + Postgres — Production-Style Local Platform
 
-A small full-stack app (React + Node.js/Express + PostgreSQL) being taken, one task at a time,
-from "runs on my laptop" to a production-style local platform. The [roadmap](#roadmap) at the
-end shows what is done and what comes next.
+A small full-stack app (React + Node.js/Express + PostgreSQL) taken from "runs on my laptop" to a
+production-style platform: containers, Kubernetes, an Ingress API gateway, CI/CD to three
+environments, platform services (Redis, BullMQ, OpenSearch, a real Postgres read replica),
+observability, autoscaling and rate limiting. Everything runs locally; Terraform provisions the
+cluster and its add-ons.
+
+```mermaid
+flowchart LR
+  B[Browser] -->|node-react.local| ING[ingress-nginx<br/>API gateway + rate limit]
+  subgraph dev namespace
+    ING -->|/| FE[frontend-service] --> FEP[(frontend pods<br/>nginx)]
+    ING -->|/api| BE[backend-service] --> BEP[(backend pods<br/>Express, HPA 2-6)]
+    BEP -->|writes| PGW[postgres-service] --> PG[(postgres-0<br/>primary)]
+    BEP -->|reads| PGR[postgres-read-service] --> PGRP[(postgres-replica-0<br/>hot standby)]
+    PG -. WAL streaming .-> PGRP
+    BEP -->|enqueue| RS[redis-service] --> R[(redis)]
+    W[(bullmq-worker)] -->|consume| RS
+    W -->|index| SS[search-service] --> OS[(opensearch)]
+    BEP -->|search| SS
+  end
+  subgraph monitoring / logging
+    PROM[Prometheus] -. scrape /metrics .-> BEP
+    PROM -. scrape .-> ING
+    FB[Fluent Bit DaemonSet] --> LOKI[Loki]
+    GRAF[Grafana] --> PROM & LOKI
+  end
+```
 
 ## Contents
 
@@ -14,8 +38,9 @@ end shows what is done and what comes next.
 6. [Task 3 — Ingress as API gateway](#task-3--ingress-as-api-gateway)
 7. [Task 4 — CI/CD & multi-environment deployment](#task-4--cicd--multi-environment-deployment)
 8. [Task 5 — Platform services](#task-5--platform-services)
-9. [Design decisions & trade-offs](#design-decisions--trade-offs)
-10. [Roadmap](#roadmap)
+9. [Task 6 — Observability, scaling & rate limiting](#task-6--observability-scaling--rate-limiting)
+10. [Design decisions & trade-offs](#design-decisions--trade-offs)
+11. [What I would do with more time](#what-i-would-do-with-more-time)
 
 ---
 
@@ -30,8 +55,8 @@ end shows what is done and what comes next.
 | Helm | 3 or 4 | only for `make cluster-kind` (no-Terraform path) |
 | Node.js | 24 | only to run tests outside Docker |
 
-Resources: Compose needs ~2.5 GB RAM (OpenSearch alone takes 1 GB); the Kubernetes setup
-needs ~4 GB free RAM.
+Resources: Compose needs ~2.5 GB RAM; the full Kubernetes stack (3 kind nodes, OpenSearch,
+Prometheus/Grafana, Loki) needs ~6 GB free RAM.
 
 ## Quick start
 
@@ -45,27 +70,30 @@ docker compose up --build     # or `make up`
 - UI: http://localhost:8080
 - API (debug only, bound to 127.0.0.1): http://localhost:4000/api/health
 
-### Kubernetes (Tasks 2–5)
+### Kubernetes (Tasks 2–6)
 
 ```bash
 make k8s-up
-# = terraform apply (kind cluster + ingress-nginx)
+# = terraform apply (kind cluster + ingress-nginx + metrics-server + Prometheus/Grafana + Loki + Fluent Bit)
+#   + kubectl apply -k observability/   (ServiceMonitor, alert rules, Grafana dashboard)
 #   + build images and `kind load` them
 #   + generate k8s/overlays/dev/secrets.env with random passwords
 #   + kubectl apply -k k8s/overlays/dev and wait for rollouts
 
 # once: map the Ingress hostnames to localhost
-echo "127.0.0.1 node-react.local preprod.node-react.local release.node-react.local" | sudo tee -a /etc/hosts
+echo "127.0.0.1 node-react.local preprod.node-react.local release.node-react.local grafana.node-react.local prometheus.node-react.local" | sudo tee -a /etc/hosts
 ```
 
 | URL | What |
 |---|---|
 | http://node-react.local | the app (frontend + `/api`) |
+| http://grafana.node-react.local | Grafana — user `admin`, password: `terraform -chdir=terraform output -raw grafana_admin_password` |
+| http://prometheus.node-react.local | Prometheus (targets, alerts) |
 
 > **Port 80 already in use** (e.g. a local nginx/apache)? Either stop it, or create the cluster
 > on another port: `make k8s-up HTTP_PORT=8880` and use `http://node-react.local:8880`.
 
-Other useful targets: `make help`, `make status`,
+Other useful targets: `make help`, `make status`, `make load-test`, `make rate-limit-test`,
 `make cluster-destroy`.
 
 ## Repository layout
@@ -83,9 +111,13 @@ Other useful targets: `make help`, `make status`,
 ├── k8s/
 │   ├── kind-config.yaml        3-node kind cluster (used by CI)
 │   ├── base/                   environment-agnostic manifests (kustomize base)
-│   ├── overlays/{dev,preprod,release}/   namespace, PV, Ingress, secrets
-├── terraform/                  kind cluster + ingress-nginx (Helm)
+│   ├── overlays/{dev,preprod,release}/   namespace, PV, Ingress, secrets, sizing
+│   └── tools/load-test.yaml    HPA load generator
+├── observability/              Helm values (Prometheus stack, Loki, Fluent Bit),
+│                               ServiceMonitor, alert rules, Grafana dashboard JSON
+├── terraform/                  kind cluster + Helm releases for all platform add-ons
 ├── .github/workflows/ci-cd.yml
+└── docs/                       screenshots / evidence
 ```
 
 Mapping from the file names suggested in the brief to this repo:
@@ -101,6 +133,8 @@ Mapping from the file names suggested in the brief to this repo:
 | `app-secrets.yaml` | `secretGenerator` in `k8s/overlays/<env>/kustomization.yaml` | built from a git-ignored `secrets.env` — see [Task 2](#task-2--kubernetes) |
 | `ingress-dev.yaml` | `k8s/overlays/dev/ingress-dev.yaml` | |
 | `redis-*`, `bullmq-worker-deployment.yaml`, `search-*` | `k8s/base/` | |
+| `prometheus.yaml`, `grafana.yaml`, `loki.yaml`, `fluentbit-daemonset.yaml` | `observability/*-values.yaml` | Helm values, installed by Terraform |
+| `hpa-backend.yaml` | `k8s/base/hpa-backend.yaml` | lives with the app so each env gets one |
 
 ---
 
@@ -166,6 +200,7 @@ be deployed to every namespace and only the differences live in the overlays:
 - Postgres PV
 - Ingress hostname
 - secrets
+- HPA bounds
 
 ```bash
 kubectl apply --server-side --force-conflicts -k k8s/overlays/dev   # what `make deploy` and CI run
@@ -213,7 +248,7 @@ carries a content hash, so changing a password rolls the pods that use it.
 
 **Other production defaults:**
 
-- `resources` requests and limits on every container (needed by the scheduler)
+- `resources` requests and limits on every container (needed by the scheduler and the HPA)
 - `runAsNonRoot`, `readOnlyRootFilesystem`, `drop: [ALL]` and seccomp `RuntimeDefault` on the
   app containers
 - Rolling updates with `maxUnavailable: 0`
@@ -236,9 +271,9 @@ two Ingress objects on host `node-react.local`:
 | Path | Backend | Policy |
 |---|---|---|
 | `/` (Prefix) | `frontend-service:80` | none |
-| `/api` (Prefix, matches `/api` and `/api/*`) | `backend-service:4000` | body size, timeouts |
+| `/api` (Prefix, matches `/api` and `/api/*`) | `backend-service:4000` | rate limit, body size, timeouts |
 
-They're split in two so API-only policy (body size, timeouts) doesn't apply
+They're split in two so API-only policy (body size, timeouts, rate limiting) doesn't apply
 to static assets. The longest-prefix match means `/api/...` always wins over `/`.
 
 **Terraform** (`terraform/`) now owns the cluster: the `tehcyx/kind` provider creates the same
@@ -255,7 +290,7 @@ Example: `POST http://node-react.local/api/items`
    ingress-nginx pod listens via `hostPort`. (In the cloud this hop is DNS → a cloud load
    balancer → the controller's Service.)
 2. **Ingress controller.** nginx matches `Host: node-react.local` and the longest path prefix
-   `/api`, and picks an upstream. ingress-nginx doesn't go through
+   `/api`, applies the rate limit, and picks an upstream. ingress-nginx doesn't go through
    the Service's virtual IP. It watches the Service's **EndpointSlices** and load-balances
    straight to the **ready** pod IPs.
 3. **Service.** `backend-service` is a stable name + virtual IP whose selector `app=backend`
@@ -303,6 +338,7 @@ How to read the status code:
 - `503` with no endpoints → readiness / selector problem
 - `502` → the pod is in the endpoint list but refused the connection (wrong port, app crashed)
 - `504` → the app is too slow (often the DB)
+- `429` → that's the rate limiter, not a fault
 
 Also check whether a NetworkPolicy blocks the controller: `allow-backend` must allow namespace
 `ingress-nginx`.
@@ -389,7 +425,8 @@ cluster on a laptop. So the deploy job has two targets:
 
 So every green run proves the images, the manifests, the rollout and the request path. The
 pipeline is unchanged when a real cluster is added. For a real on-prem/laptop cluster, the
-alternatives would be a **self-hosted runner** next to the cluster, or (better) GitOps.
+alternatives would be a **self-hosted runner** next to the cluster, or (better) GitOps — see
+"more time".
 
 ### How CI secrets are stored and used
 
@@ -455,13 +492,13 @@ The queue does real work instead of just logging:
 All Services are `ClusterIP`, and inside the namespace a **default-deny NetworkPolicy** plus
 explicit allow rules (`k8s/base/networkpolicies.yaml`) enforce who can talk to whom:
 
-| To ↓ / allowed from → | ingress-nginx | frontend | backend | worker |
-|---|---|---|---|---|
-| frontend :8080 | ✅ | | | |
-| backend :4000 | ✅ | ✅ (nginx proxy) | | |
-| postgres / replica :5432 | | | ✅ | ✅ |
-| redis :6379 | | | ✅ | ✅ |
-| opensearch :9200 | | | ✅ | ✅ |
+| To ↓ / allowed from → | ingress-nginx | frontend | backend | worker | monitoring |
+|---|---|---|---|---|---|
+| frontend :8080 | ✅ | | | | |
+| backend :4000 | ✅ | ✅ (nginx proxy) | | | ✅ (/metrics) |
+| postgres / replica :5432 | | | ✅ | ✅ | |
+| redis :6379 | | | ✅ | ✅ | |
+| opensearch :9200 | | | ✅ | ✅ | |
 
 Verified on kind (kindnet enforces NetworkPolicy):
 
@@ -529,6 +566,134 @@ writer for N seconds after they write.
 
 ---
 
+## Task 6 — Observability, scaling & rate limiting
+
+Installed by Terraform (`terraform/platform.tf`) from pinned chart versions:
+
+| Component | Chart | Namespace | Config |
+|---|---|---|---|
+| Prometheus, Alertmanager, Grafana, kube-state-metrics, node-exporter | `kube-prometheus-stack` 92.3.0 | `monitoring` | `observability/kube-prometheus-stack-values.yaml` |
+| Loki (single binary, filesystem) | `loki` 7.3.0 | `logging` | `observability/loki-values.yaml` |
+| Fluent Bit **DaemonSet** | `fluent-bit` 0.58.3 | `logging` | `observability/fluentbit-values.yaml` |
+| metrics-server (for the HPA) | `metrics-server` 3.14.0 | `kube-system` | `terraform/values/metrics-server.yaml` |
+
+Plus `kubectl apply -k observability/`, which adds:
+
+- `servicemonitor-backend.yaml`: scrape `/metrics` of every `backend-service`, in every env
+  namespace
+- `prometheusrule-backend.yaml`: the alerts below
+- the **Grafana dashboard as code** (`dashboards/backend-dashboard.json`), loaded by Grafana's
+  sidecar from a labelled ConfigMap
+
+### Metrics
+
+The backend exports Prometheus metrics with `prom-client`:
+
+- `http_requests_total{method,route,status}`
+- `http_request_duration_seconds` (histogram)
+- Node.js process metrics
+
+The `route` label is the matched Express route pattern, never the raw URL, so label
+cardinality stays bounded. The ingress controller is scraped too.
+
+Dashboard **"Node React Platform – Backend"**, with an environment selector:
+
+| Panel | Query source |
+|---|---|
+| Backend CPU per pod (+ request line) | cAdvisor `container_cpu_usage_seconds_total` |
+| Backend memory per pod (+ limit line) | cAdvisor `container_memory_working_set_bytes` |
+| Request rate by route | `http_requests_total` |
+| Error rate (5xx ratio) | `http_requests_total{status=~"5.."}` / all |
+| Backend replicas over time (available / HPA desired / max) | kube-state-metrics |
+| Latency p50/p95/p99 | `http_request_duration_seconds_bucket` |
+| Ingress responses by status (shows 429s) | `nginx_ingress_controller_requests` |
+| Backend + worker warn/error logs | Loki |
+
+### What I alert on, and why
+
+| Alert | Condition | Severity | Why |
+|---|---|---|---|
+| `BackendHighErrorRate` | 5xx / all > 5% for 5m | critical | Users are getting errors right now. A ratio, not a count, so it means the same at 1 or 1000 req/s. |
+| `BackendHighLatencyP95` | p95 > 500ms for 10m | warning | Users are waiting. Catches slow queries, a struggling dependency or CPU throttling *before* they turn into errors. p95, not the average, because averages hide the slow tail. |
+| `BackendNoReadyPods` | available replicas == 0 for 2m | critical | Total outage, including when there's no traffic to produce errors. |
+| `BackendHPAAtMaxReplicas` | current ≥ max for 15m | warning | Autoscaling has run out of headroom. The next symptom is latency, then errors. Act (raise max, add nodes, optimize) before that. |
+| `BackendHighCPU` | CPU > 85% of limit for 10m | warning | Sustained throttling. Combined with the HPA alert it separates "needs more pods" from "pods are mis-sized". |
+| `BackendRestarting` | > 3 restarts in 15m | warning | Crash loops (OOMKilled, bad config) stay invisible to the error rate while other replicas still serve. |
+
+I alert on **symptoms users feel** (errors, latency, availability) as pages, and on **causes**
+(CPU, capacity, restarts) as warnings. CPU alone never pages: high CPU with good latency is
+just efficient use of resources. Next additions: replica lag, queue depth / job failure rate,
+and SLO burn-rate alerts instead of fixed thresholds.
+
+### Logging
+
+Fluent Bit runs as a **DaemonSet**: one pod per node, including the control plane. That's the
+only way to read every container's log file (`/var/log/containers/*.log`) on that node,
+whichever pods land there. It adds Kubernetes metadata and ships to Loki with low-cardinality
+labels only (`namespace`, `app`, `container`). The backend and the ingress controller log
+**JSON**, so every field stays queryable without making it a label.
+
+Example queries (Grafana → Explore → Loki):
+
+```logql
+{namespace="dev", app="backend"}                                          # all backend logs
+{namespace="dev", app="backend"} | json | level="error"                   # errors only
+{namespace="dev", app="backend"} | json | msg="request" | status >= 400   # failed requests
+{namespace="dev", app="backend"} | json | duration_ms > 200               # slow requests
+{namespace="dev", app="bullmq-worker"} | json | msg="job failed"          # queue failures
+{namespace="ingress-nginx"} | json | status = 429                         # rate-limited calls
+sum by (status) (count_over_time({namespace="dev", app="backend"} | json | msg="request" [5m]))
+```
+
+### Autoscaling
+
+`k8s/base/hpa-backend.yaml` (autoscaling/v2):
+
+- 2–6 replicas (release overlay: 3–10)
+- target **70% CPU** or **80% memory** of requests
+- scale-up immediately (+2 pods / 30s)
+- scale-down after a 5-minute stabilization window (−1 pod / min), to avoid flapping
+
+Min 2 means there's always redundancy across nodes, and together with the PDB, a node drain
+never takes the API down. The backend Deployment deliberately has **no `replicas` field** any
+more: the HPA owns it, so a deploy never resets a scaled-up backend to the manifest's count.
+
+Verified with `make load-test` (50 concurrent connections from inside the cluster, which
+bypasses the rate limit): CPU went to 131–447% of request, and the HPA scaled **2 → 4 → 6**
+within ~90 s.
+
+### Rate limiting
+
+These are ingress-nginx annotations on the **API Ingress only**, so static assets are never
+throttled:
+
+| Setting | dev / preprod | release | Meaning |
+|---|---|---|---|
+| `limit-rps` | 20 | 50 | sustained requests per second **per client IP** |
+| `limit-burst-multiplier` | 5 | 5 | allows bursts up to 5 × rps (100 / 250) before rejecting |
+| `limit-connections` | 20 | 20 | concurrent connections per client IP |
+| status code (controller config) | 429 | 429 | `Too Many Requests` instead of the default 503, so clients can back off and dashboards can tell throttling from outages |
+
+**Why these numbers:**
+
+- A real user of this UI makes a few API calls per page action. 20 rps sustained with a 100
+  burst is far above that, so humans and page loads with parallel fetches never hit it. A
+  script hammering the API is stopped quickly, and a single client can only use a fraction of
+  the backend's capacity: each pod handles a few hundred simple req/s, and there are 2–6 pods.
+- Release gets more headroom because real users can sit behind a shared NAT IP (offices,
+  mobile carriers).
+- Limits are per controller replica (nginx keeps counters in memory). With N controller
+  replicas the effective limit is up to N × rps. For a global limit, use Redis-backed limiting
+  at a gateway.
+
+Verified: 300 parallel requests through the Ingress → **69 × 200, 231 × 429**. 100 parallel
+requests to `/` → all 200. `make rate-limit-test` reproduces it.
+
+Rate limiting is a guard against abuse and noisy neighbours, not capacity planning. Long-term
+limits should come from load tests and be per API key/user (at a gateway), not just per IP.
+
+---
+
 ## Design decisions & trade-offs
 
 | Decision | Why | Trade-off |
@@ -537,7 +702,7 @@ writer for N seconds after they write.
 | **Fail fast on missing secrets, no defaults in code** | a misconfigured deploy fails at startup instead of connecting with a guessable password | local runs need a `.env` (`make env` generates one) |
 | **kustomize base + overlays** instead of `sed` on manifests | one source of truth, per-env diffs are small and reviewable, CI only changes the image tag | less flexible than Helm for third-party-style packaging |
 | **hostPath PV pinned to a labelled node** | satisfies the explicit PV/PVC requirement on kind | node-local storage: if that node dies, the data is gone until it returns. In the cloud use a CSI StorageClass (EBS/PD) and drop the static PV |
-| **Server-side apply** | the API server tracks field ownership | `--force-conflicts` makes the deploy tooling the owner of the fields it sets, so manual `kubectl edit` changes are overwritten on the next deploy (intended) |
+| **Server-side apply** | the API server tracks field ownership; the HPA owns `replicas`, so a deploy never resets a scaled-up backend | `--force-conflicts` makes the deploy tooling the owner of the fields it sets, so manual `kubectl edit` changes are overwritten on the next deploy (intended) |
 | **Terraform for cluster + platform add-ons, not the app** | infrastructure changes rarely and needs plan/apply; app releases happen many times a day via CI | `k8s/kind-config.yaml` (used by CI) and `terraform/main.tf` describe the same cluster and must be kept in sync |
 | **Helm for third-party, kustomize for our app** | upstream charts are maintained by their authors; our app is simple enough for plain YAML | two tools |
 | **ingress-nginx** | suggested by the brief, mature, simple annotations | project retired in 2026; Gateway API is the forward path |
@@ -546,14 +711,30 @@ writer for N seconds after they write.
 | **Async indexing via BullMQ** | writes never depend on search availability | search is eventually consistent (ms–s behind) |
 | **OpenSearch / Redis on emptyDir** | dev mode; the search index is derived data rebuildable from Postgres | Redis queue contents are lost if the pod is deleted (AOF survives container restarts only) |
 | **Security plugin disabled on OpenSearch** | dev mode, as the brief allows | only acceptable because NetworkPolicies restrict it to the backend tier |
+| **Loki over Elasticsearch for logs** | a fraction of the RAM, label model fits Kubernetes, same Grafana UI | weaker full-text search than ES |
 
-## Roadmap
+## What I would do with more time
 
-| Task | Status |
-|---|---|
-| 1. Docker Compose | ✅ done |
-| 2. Kubernetes (dev namespace) | ✅ done |
-| 3. Ingress / API gateway + Terraform | ✅ done |
-| 4. CI/CD & multi-environment deployment | ✅ done |
-| 5. Redis, queue, search, read/write DB | ✅ done |
-| 6. Observability, autoscaling, rate limiting | planned |
+- **GitOps:** Argo CD / Flux watching `k8s/overlays/*`. CI would only build, scan and commit
+  the new tag, and the cluster pulls. No cluster credentials in CI, drift detection, and
+  rollback = `git revert`.
+- **Secrets:** External Secrets Operator (Vault / AWS Secrets Manager) or Sealed Secrets
+  instead of files generated from CI secrets. Encryption at rest for etcd.
+- **Database:** CloudNativePG operator (automated failover, backups to object storage, PITR,
+  pooler), real migrations tool, PgBouncer, `postgres_exporter` + replica-lag alerts.
+- **Progressive delivery:** Argo Rollouts canary (10% → 50% → 100%) gated on the error-rate /
+  latency queries above, with automatic abort.
+- **Supply chain:** SBOM (syft), image signing (cosign) + admission verification (Kyverno), pin
+  base images by digest with Renovate/Dependabot updates.
+- **Policies:** Kyverno/Gatekeeper rules (no `latest`, required limits/probes, non-root) and
+  egress NetworkPolicies (deny-all except DNS and named dependencies).
+- **Tracing:** OpenTelemetry SDK in the backend → Tempo, with trace IDs in the JSON logs, linked
+  from Grafana panels.
+- **Scaling:** KEDA to scale the BullMQ worker on queue depth; HPA on request rate (custom
+  metrics) instead of CPU only; multiple ingress controller replicas.
+- **Testing:** integration tests against real Postgres/Redis in CI (service containers),
+  frontend tests, k6 load tests with thresholds as a pipeline gate.
+- **Alerting:** route Alertmanager to Slack/PagerDuty, SLOs with multi-window burn-rate alerts,
+  runbook links in every alert.
+- **Hardening:** run Postgres as non-root with `restricted` Pod Security, TLS on the Ingress
+  (cert-manager), OpenSearch security plugin enabled.
