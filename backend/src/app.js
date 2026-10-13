@@ -1,5 +1,6 @@
 import express from "express";
 import { log } from "./logger.js";
+import { metricsMiddleware, register } from "./metrics.js";
 
 // The app receives its dependencies (db, redis, queue, search) instead of
 // importing them, so tests can pass in fakes and run without any services.
@@ -8,11 +9,12 @@ export function createApp({ db, redis, queue, search, isReady = () => true }) {
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "100kb" }));
+  app.use(metricsMiddleware);
 
-  // One access-log line per request; probe traffic is skipped to keep the
-  // logs readable.
+  // One access-log line per request; probe and scrape traffic is skipped to
+  // keep the logs readable.
   app.use((req, res, next) => {
-    if (req.path.startsWith("/api/health")) return next();
+    if (req.path.startsWith("/api/health") || req.path === "/metrics") return next();
     const start = process.hrtime.bigint();
     res.on("finish", () => {
       log.info("request", {
@@ -23,6 +25,11 @@ export function createApp({ db, redis, queue, search, isReady = () => true }) {
       });
     });
     next();
+  });
+
+  app.get("/metrics", async (req, res) => {
+    res.set("Content-Type", register.contentType);
+    res.send(await register.metrics());
   });
 
   app.get("/api/health", (req, res) => res.json({ status: "ok" }));
