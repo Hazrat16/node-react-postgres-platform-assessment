@@ -66,7 +66,7 @@ k8s-up: cluster images deploy hosts ## Everything: cluster + ingress + app in de
 
 hosts: ## Print the /etc/hosts line needed for the Ingress hostnames
 	@echo "Add this to /etc/hosts (once):"
-	@echo "127.0.0.1 node-react.local"
+	@echo "127.0.0.1 node-react.local preprod.node-react.local release.node-react.local"
 
 status: ## kubectl get all in $(ENV)
 	kubectl get all,ingress,pvc -n $(ENV)

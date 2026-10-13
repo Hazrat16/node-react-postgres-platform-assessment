@@ -12,8 +12,9 @@ end shows what is done and what comes next.
 4. [Task 1 — Docker Compose](#task-1--docker-compose)
 5. [Task 2 — Kubernetes](#task-2--kubernetes)
 6. [Task 3 — Ingress as API gateway](#task-3--ingress-as-api-gateway)
-7. [Design decisions & trade-offs](#design-decisions--trade-offs)
-8. [Roadmap](#roadmap)
+7. [Task 4 — CI/CD & multi-environment deployment](#task-4--cicd--multi-environment-deployment)
+8. [Design decisions & trade-offs](#design-decisions--trade-offs)
+9. [Roadmap](#roadmap)
 
 ---
 
@@ -42,7 +43,7 @@ docker compose up --build     # or `make up`
 - UI: http://localhost:8080
 - API (debug only, bound to 127.0.0.1): http://localhost:4000/api/health
 
-### Kubernetes (Tasks 2–3)
+### Kubernetes (Tasks 2–4)
 
 ```bash
 make k8s-up
@@ -52,7 +53,7 @@ make k8s-up
 #   + kubectl apply -k k8s/overlays/dev and wait for rollouts
 
 # once: map the Ingress hostnames to localhost
-echo "127.0.0.1 node-react.local" | sudo tee -a /etc/hosts
+echo "127.0.0.1 node-react.local preprod.node-react.local release.node-react.local" | sudo tee -a /etc/hosts
 ```
 
 | URL | What |
@@ -78,10 +79,11 @@ Other useful targets: `make help`, `make status`,
 ├── .env.example                Compose config template (.env is git-ignored)
 ├── Makefile                    thin wrappers around the commands in this README
 ├── k8s/
-│   ├── kind-config.yaml        3-node kind cluster
+│   ├── kind-config.yaml        3-node kind cluster (used by CI)
 │   ├── base/                   environment-agnostic manifests (kustomize base)
-│   ├── overlays/dev/           namespace, PV, Ingress, secrets
+│   ├── overlays/{dev,preprod,release}/   namespace, PV, Ingress, secrets
 ├── terraform/                  kind cluster + ingress-nginx (Helm)
+├── .github/workflows/ci-cd.yml
 ```
 
 Mapping from the file names suggested in the brief to this repo:
@@ -153,7 +155,7 @@ on its own, because ordering at startup doesn't help when the DB restarts later.
 
 ## Task 2 — Kubernetes
 
-Everything for an environment lives in its own namespace (`dev`). The
+Everything for an environment lives in its own namespace (`dev`, `preprod`, `release`). The
 manifests are a **kustomize base + one overlay per environment**, so the same base can later
 be deployed to every namespace and only the differences live in the overlays:
 
@@ -163,7 +165,7 @@ be deployed to every namespace and only the differences live in the overlays:
 - secrets
 
 ```bash
-kubectl apply --server-side --force-conflicts -k k8s/overlays/dev   # what `make deploy` runs
+kubectl apply --server-side --force-conflicts -k k8s/overlays/dev   # what `make deploy` and CI run
 kubectl get all -n dev
 ```
 
@@ -200,7 +202,7 @@ is never killed. The frontend has probes too.
 
 **Secrets.** There is no `app-secrets.yaml` in git. Each overlay's `kustomization.yaml` has a
 `secretGenerator` that builds `app-secrets` from a git-ignored `secrets.env` (`make secrets`
-generates one with random passwords). The generated name
+generates one with random passwords; CI writes it from GitHub secrets). The generated name
 carries a content hash, so changing a password rolls the pods that use it.
 
 **Other production defaults:**
@@ -236,7 +238,7 @@ to static assets. The longest-prefix match means `/api/...` always wins over `/`
 **Terraform** (`terraform/`) now owns the cluster: the `tehcyx/kind` provider creates the same
 3-node cluster as `k8s/kind-config.yaml`, and the `helm` provider installs ingress-nginx from a
 pinned chart version. The app itself is not managed by Terraform; it is deployed with kustomize
-(`make deploy`).
+(`make deploy`, CI).
 
 ### Request path: Browser → Ingress → Service → Pod → PostgreSQL
 
@@ -330,18 +332,104 @@ The Ingress is already a path-based API gateway. Splitting the backend means:
 
 ---
 
+## Task 4 — CI/CD & multi-environment deployment
+
+`.github/workflows/ci-cd.yml`
+
+| Branch | Namespace | Hostname |
+|---|---|---|
+| `master` | `dev` | node-react.local |
+| `pre-release/v*` | `preprod` | preprod.node-react.local |
+| `release/v*` | `release` | release.node-react.local |
+
+```
+push ──► test (backend: lint + unit tests │ frontend: build)  ─┐
+     ──► validate (kustomize build all overlays → kubeconform, │
+                   docker compose config, terraform validate)  ─┤
+                                                                ▼
+         build: docker build ──► Trivy scan (fail on fixable CRITICAL) ──► push to GHCR
+                tag = <branch>-<short-sha>   e.g. master-1a2b3c4, release-v1.2-1a2b3c4
+                                                                ▼
+         deploy (GitHub Environment = namespace, concurrency-locked per env):
+                pin overlay images to that tag ──► kubectl apply -k k8s/overlays/<env>
+                ──► rollout status ──► smoke test through the Ingress
+                ──► on failure: diagnostics (+ automatic rollout undo on a real cluster)
+```
+
+- Pull requests to `master` run test, validate and build (no push, no deploy).
+- Images are tagged `<branch>-<sha>` and **never** `latest`. Every running pod maps back to an
+  exact commit, and a tag never changes content, which is what makes rollback precise.
+- Build → scan → push: an image with a fixable critical CVE never reaches the registry.
+- All third-party actions are pinned to a **commit SHA** (with the version in a comment). Tags
+  are mutable; the 2026 `trivy-action` compromise worked by force-pushing tags.
+- `concurrency: deploy-<env>` with `cancel-in-progress: false`: two pushes never deploy to the
+  same environment at once, and a running rollout is never cancelled half-way.
+
+**Where does it deploy?** The brief is local-only, and GitHub-hosted runners can't reach a kind
+cluster on a laptop. So the deploy job has two targets:
+
+- If the environment has a `KUBECONFIG_B64` secret, it deploys to that real cluster.
+- Otherwise it creates an **ephemeral kind cluster on the runner** (same `k8s/kind-config.yaml`,
+  same ingress-nginx values). It deploys the freshly pushed GHCR images into the branch's
+  namespace and runs an end-to-end smoke test through the Ingress: UI loads, POST an item, GET
+  it back.
+
+So every green run proves the images, the manifests, the rollout and the request path. The
+pipeline is unchanged when a real cluster is added. For a real on-prem/laptop cluster, the
+alternatives would be a **self-hosted runner** next to the cluster, or (better) GitOps.
+
+### How CI secrets are stored and used
+
+| Secret | Where | Used for |
+|---|---|---|
+| `GITHUB_TOKEN` | built-in, short-lived, per run | pushing to GHCR (`packages: write` granted only to the build job; every other job has `contents: read`) |
+| `KUBECONFIG_B64` | **Environment** secret (`dev` / `preprod` / `release`) | cluster access; should be a ServiceAccount token whose RBAC is limited to that one namespace |
+| `DB_PASSWORD` | Environment secret | written to the git-ignored `secrets.env` → kustomize `secretGenerator` → k8s Secret |
+| `GHCR_PULL_TOKEN` (optional) | Environment secret | `read:packages` token for the cluster's image pull secret (GITHUB_TOKEN expires after the job) |
+
+- Each environment has its **own** secrets, so a `master` build can never read production
+  credentials. The `release` environment can additionally require **manual approval**
+  (Environment protection rule) before the deploy job starts.
+- Secrets are never interpolated into scripts. They're passed via `env:`, masked
+  (`::add-mask::`), written with `umask 077`, and never echoed.
+- No secret is in git: `.env`, `secrets.env` and Terraform state are git-ignored; only
+  `*.example` templates are committed.
+- The secret's name carries a content hash (kustomize), so rotating a password automatically
+  rolls the pods that use it.
+
+### Rollback strategy
+
+1. **Automatic.** If `rollout status` or the smoke test fails on a real cluster, the pipeline
+   runs `kubectl rollout undo` for the app Deployments. Rolling updates use
+   `maxUnavailable: 0`, so a bad release never takes the old pods down first. Verified locally:
+   with a non-existent image tag, the new pod sat in `ErrImagePull` while the old pods kept
+   serving `200`, and `kubectl rollout undo` restored it.
+2. **Manual, fast.** *Actions → CI/CD → Run workflow* with `environment=release` and an empty
+   tag runs `kubectl rollout undo` (previous ReplicaSet; `revisionHistoryLimit: 5` keeps them).
+3. **Manual, precise.** Same workflow with `image_tag=release-v1.2-1a2b3c4` redeploys that exact,
+   already built and scanned image. Because tags are immutable `<branch>-<sha>`, this is exact,
+   and it doesn't depend on Kubernetes still having the old ReplicaSet.
+4. **Data.** Schema changes must be backward-compatible (expand → migrate → contract), so the
+   previous image still works against the new schema. Otherwise an app rollback isn't safe.
+
+Locally: `kubectl -n dev rollout history deploy/backend` and
+`kubectl -n dev rollout undo deploy/backend [--to-revision=N]`.
+
+---
+
 ## Design decisions & trade-offs
 
 | Decision | Why | Trade-off |
 |---|---|---|
 | **Same-origin `/api`** (nginx proxy in Compose, Ingress in k8s) | one image for all envs, no CORS, no internal hostnames in the browser | frontend nginx needs `BACKEND_URL` |
 | **Fail fast on missing secrets, no defaults in code** | a misconfigured deploy fails at startup instead of connecting with a guessable password | local runs need a `.env` (`make env` generates one) |
-| **kustomize base + overlays** instead of `sed` on manifests | one source of truth, per-env diffs are small and reviewable | less flexible than Helm for third-party-style packaging |
+| **kustomize base + overlays** instead of `sed` on manifests | one source of truth, per-env diffs are small and reviewable, CI only changes the image tag | less flexible than Helm for third-party-style packaging |
 | **hostPath PV pinned to a labelled node** | satisfies the explicit PV/PVC requirement on kind | node-local storage: if that node dies, the data is gone until it returns. In the cloud use a CSI StorageClass (EBS/PD) and drop the static PV |
 | **Server-side apply** | the API server tracks field ownership | `--force-conflicts` makes the deploy tooling the owner of the fields it sets, so manual `kubectl edit` changes are overwritten on the next deploy (intended) |
 | **Terraform for cluster + platform add-ons, not the app** | infrastructure changes rarely and needs plan/apply; app releases happen many times a day via CI | `k8s/kind-config.yaml` (used by CI) and `terraform/main.tf` describe the same cluster and must be kept in sync |
 | **Helm for third-party, kustomize for our app** | upstream charts are maintained by their authors; our app is simple enough for plain YAML | two tools |
 | **ingress-nginx** | suggested by the brief, mature, simple annotations | project retired in 2026; Gateway API is the forward path |
+| **Ephemeral kind in CI** | the only way to get a real deploy + smoke test from GitHub-hosted runners for a local-only brief | doesn't deploy to *your* laptop cluster; a real cluster just needs `KUBECONFIG_B64` |
 
 ## Roadmap
 
@@ -350,6 +438,6 @@ The Ingress is already a path-based API gateway. Splitting the backend means:
 | 1. Docker Compose | ✅ done |
 | 2. Kubernetes (dev namespace) | ✅ done |
 | 3. Ingress / API gateway + Terraform | ✅ done |
-| 4. CI/CD & multi-environment deployment | planned |
+| 4. CI/CD & multi-environment deployment | ✅ done |
 | 5. Redis, queue, search, read/write DB | planned |
 | 6. Observability, autoscaling, rate limiting | planned |
