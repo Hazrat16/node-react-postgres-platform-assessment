@@ -1,0 +1,84 @@
+# One command: `docker compose up --build`  (after `cp .env.example .env`)
+#
+# Networks:
+#   web  - frontend <-> backend
+#   data - backend <-> postgres
+#          (internal: no route to the outside world, and the frontend
+#           container has no path to the database at all)
+#
+# Only the frontend publishes a host port; the backend is bound to 127.0.0.1
+# for debugging with curl. The database is not published.
+
+name: node-react-platform
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:?set DB_USER in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_DB: ${DB_NAME:?set DB_NAME in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [data]
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: node-react-backend:local
+    environment:
+      DB_HOST: postgres
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      PORT: 4000
+    ports:
+      - "127.0.0.1:4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/api/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [web, data]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: /api
+    image: node-react-frontend:local
+    environment:
+      BACKEND_URL: http://backend:4000
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [web]
+    restart: unless-stopped
+
+networks:
+  web: {}
+  data:
+    internal: true
+
+volumes:
+  postgres_data:
