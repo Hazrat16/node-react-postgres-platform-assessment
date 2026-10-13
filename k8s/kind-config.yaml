@@ -1,15 +1,20 @@
-# Local cluster: 1 control-plane + 2 workers.
-# The frontend NodePort (30080) is mapped to the host, so the UI is at
-# http://localhost:30080.
+# Local cluster: 1 control-plane (runs the ingress controller, ports 80/443
+# mapped to the host) + 2 workers. Used by `make cluster-kind`;
+# terraform/main.tf creates the same topology natively - keep the two in sync.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: node-react
 nodes:
   - role: control-plane
     image: kindest/node:v1.35.0
+    labels:
+      ingress-ready: "true"
     extraPortMappings:
-      - containerPort: 30080
-        hostPort: 30080
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
         protocol: TCP
   - role: worker
     image: kindest/node:v1.35.0

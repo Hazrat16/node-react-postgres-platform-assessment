@@ -1,6 +1,5 @@
-# NodePort: the frontend is reachable from outside the cluster on port
-# 30080 of every node (kind maps it to localhost:30080). Its nginx proxies
-# /api to backend-service, so the backend itself stays internal.
+# ClusterIP: the frontend is exposed externally through the Ingress
+# (http://node-react.local), not through a NodePort.
 apiVersion: v1
 kind: Service
 metadata:
@@ -8,11 +7,10 @@ metadata:
   labels:
     app: frontend
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: frontend
   ports:
     - name: http
       port: 80
       targetPort: http
-      nodePort: 30080

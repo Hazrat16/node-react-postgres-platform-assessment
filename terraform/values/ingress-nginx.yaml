@@ -1,0 +1,24 @@
+# ingress-nginx tuned for kind: runs on the control-plane node (label
+# ingress-ready=true) and binds host ports 80/443, which kind maps to the
+# host machine.
+controller:
+  hostPort:
+    enabled: true
+  service:
+    type: NodePort
+  nodeSelector:
+    ingress-ready: "true"
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1 # hostPort: old pod must go before the new one binds
+  ingressClassResource:
+    default: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi

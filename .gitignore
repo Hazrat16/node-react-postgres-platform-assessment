@@ -5,3 +5,9 @@ dist/
 # Local secrets - never committed. See .env.example and k8s/overlays/*/secrets.env.example
 .env
 secrets.env
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.kubeconfig

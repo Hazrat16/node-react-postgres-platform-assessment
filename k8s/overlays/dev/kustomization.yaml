@@ -7,6 +7,7 @@ resources:
   - namespace-dev.yaml
   - ../../base
   - postgres-pv.yaml
+  - ingress-dev.yaml
 
 labels:
   - pairs:
