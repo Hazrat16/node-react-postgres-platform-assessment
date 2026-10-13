@@ -1,6 +1,7 @@
 # Local cluster: 1 control-plane (runs the ingress controller, ports 80/443
-# mapped to the host) + 2 workers. Used by `make cluster-kind`;
-# terraform/main.tf creates the same topology natively - keep the two in sync.
+# mapped to the host) + 2 workers. Used by CI (helm/kind-action) and by
+# `make cluster-kind`. terraform/main.tf creates the same topology natively;
+# keep the two in sync.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: node-react

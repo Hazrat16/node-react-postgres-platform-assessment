@@ -1,0 +1,31 @@
+# Statically provisioned volume for the Postgres primary. hostPath lives on
+# the kind node, so it is pinned to the node labelled node-react/storage=true
+# (see k8s/kind-config.yaml); otherwise a rescheduled pod could land on a
+# different node with an empty directory. claimRef pre-binds it to this
+# environment's PVC. Retain = deleting the PVC never deletes the data.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-pv-release
+  labels:
+    app: postgres
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 2Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /var/local-data/postgres-release
+    type: DirectoryOrCreate
+  claimRef:
+    namespace: release
+    name: postgres-pvc
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node-react/storage
+              operator: In
+              values: ["true"]
