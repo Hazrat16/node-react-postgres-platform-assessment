@@ -1,3 +1,13 @@
+# CI/CD: test -> build & scan -> push to GHCR -> deploy to the namespace that
+# matches the branch.
+#
+#   master          -> dev
+#   pre-release/v*  -> preprod
+#   release/v*      -> release
+#
+# Pull requests run tests, manifest validation and image builds (no push, no
+# deploy). Third-party actions are pinned to commit SHAs: tags can be
+# force-pushed, SHAs cannot.
 name: CI/CD
 
 on:
@@ -6,155 +16,394 @@ on:
       - master
       - "pre-release/v*"
       - "release/v*"
+  pull_request:
+    branches: [master]
   workflow_dispatch:
     inputs:
-      rollback_namespace:
-        description: "Namespace to roll back (leave empty to skip)"
+      environment:
+        description: "Environment (namespace) to roll back"
+        type: choice
+        options: [dev, preprod, release]
+        required: true
+      image_tag:
+        description: "Image tag to redeploy (e.g. master-1a2b3c4). Empty = kubectl rollout undo"
         required: false
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_BACKEND: ${{ github.repository }}-backend
-  IMAGE_FRONTEND: ${{ github.repository }}-frontend
+  NODE_VERSION: "24"
 
 jobs:
-  build-and-test:
-    if: github.event_name == 'push'
+  # ---------------------------------------------------------------------------
+  test:
+    if: github.event_name != 'workflow_dispatch'
+    name: test (${{ matrix.service }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [backend, frontend]
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
 
-      - name: Install backend dependencies
-        working-directory: backend
+      - name: Install dependencies
         run: npm ci
 
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
+      - name: Lint (syntax check) and unit tests
+        if: matrix.service == 'backend'
+        run: |
+          npm run lint
+          npm test
 
-      - name: Backend build validation
-        working-directory: backend
-        run: node --check src/index.js
-
-      - name: Backend tests
-        working-directory: backend
-        run: npm test --if-present
-
-      - name: Frontend build
-        working-directory: frontend
+      - name: Production build
+        if: matrix.service == 'frontend'
         run: npm run build
 
-  build-and-push:
-    if: github.event_name == 'push'
-    needs: build-and-test
+      - name: Dependency audit (high+ only, report)
+        run: npm audit --omit=dev --audit-level=high || echo "::warning::npm audit found issues in ${{ matrix.service }}"
+
+  # ---------------------------------------------------------------------------
+  validate:
+    if: github.event_name != 'workflow_dispatch'
+    name: validate manifests & IaC
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+
+      # Render every overlay with placeholder secrets and validate against the
+      # Kubernetes OpenAPI schemas (CRDs like ServiceMonitor are skipped).
+      - name: Render and validate kustomize overlays
+        run: |
+          for env in dev preprod release; do
+            cp k8s/overlays/$env/secrets.env.example k8s/overlays/$env/secrets.env
+            kubectl kustomize k8s/overlays/$env \
+              | kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.35.0
+          done
+
+      - name: Validate docker-compose.yml
+        run: cp .env.example .env && docker compose config --quiet
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+
+      - name: Terraform fmt + validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  # ---------------------------------------------------------------------------
+  build:
+    if: github.event_name != 'workflow_dispatch'
+    needs: [test, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to GHCR with the built-in GITHUB_TOKEN
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       namespace: ${{ steps.meta.outputs.namespace }}
+      image_backend: ${{ steps.meta.outputs.image_backend }}
+      image_frontend: ${{ steps.meta.outputs.image_frontend }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Tag = <branch-name>-<short-sha> so every image is traceable back to
-      # the exact commit and branch that produced it.
-      - name: Compute image tag and target namespace
+      # Tag = <branch>-<short sha>, e.g. master-1a2b3c4 or release-v1.2-1a2b3c4:
+      # every image is traceable to the exact branch and commit, and tags are
+      # never reused (no mutable "latest" in deployments).
+      - name: Compute image names, tag and target namespace
         id: meta
         run: |
-          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          SAFE_BRANCH=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
-          echo "tag=${SAFE_BRANCH}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-
-          case "${GITHUB_REF_NAME}" in
-            master) echo "namespace=dev" >> "$GITHUB_OUTPUT" ;;
-            pre-release/v*) echo "namespace=preprod" >> "$GITHUB_OUTPUT" ;;
-            release/v*) echo "namespace=release" >> "$GITHUB_OUTPUT" ;;
+          set -euo pipefail
+          REF="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          SAFE_BRANCH=$(echo "$REF" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+          REPO=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]') # GHCR requires lowercase
+          case "$REF" in
+            master)          NS=dev ;;
+            pre-release/v*)  NS=preprod ;;
+            release/v*)      NS=release ;;
+            *)               NS=none ;;
           esac
+          {
+            echo "tag=${SAFE_BRANCH}-${SHORT_SHA}"
+            echo "namespace=${NS}"
+            echo "image_backend=${REGISTRY}/${REPO}-backend"
+            echo "image_frontend=${REGISTRY}/${REPO}-frontend"
+          } >> "$GITHUB_OUTPUT"
 
-      # GITHUB_TOKEN is short-lived and scoped to this repo/run only - no
-      # long-lived registry credentials are stored anywhere in the repo.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push backend image
-        uses: docker/build-push-action@v6
+      # Build -> scan -> push: an image with fixable CRITICAL CVEs never
+      # reaches the registry. The second build is a cache hit.
+      - name: Build backend
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.backend
+          load: true
+          tags: ${{ steps.meta.outputs.image_backend }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+      - name: Build frontend
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.frontend
+          load: true
+          tags: ${{ steps.meta.outputs.image_frontend }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      - name: Scan backend image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_backend }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan frontend image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_frontend }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push backend
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.backend
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_BACKEND }}:${{ steps.meta.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_BACKEND }}:${{ steps.meta.outputs.namespace }}-latest
+          tags: ${{ steps.meta.outputs.image_backend }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=backend
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Build and push frontend image
-        uses: docker/build-push-action@v6
+      - name: Push frontend
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.frontend
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_FRONTEND }}:${{ steps.meta.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_FRONTEND }}:${{ steps.meta.outputs.namespace }}-latest
+          tags: ${{ steps.meta.outputs.image_frontend }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=frontend
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
+  # ---------------------------------------------------------------------------
   deploy:
-    if: github.event_name == 'push'
-    needs: build-and-push
+    if: github.event_name == 'push' && needs.build.outputs.namespace != 'none'
+    needs: build
     runs-on: ubuntu-latest
-    environment: ${{ needs.build-and-push.outputs.namespace }}
+    # GitHub Environment per namespace: holds that environment's secrets and
+    # can require manual approval (e.g. reviewers on "release").
+    environment: ${{ needs.build.outputs.namespace }}
+    concurrency:
+      group: deploy-${{ needs.build.outputs.namespace }}
+      cancel-in-progress: false # never cancel a rollout half-way
+    env:
+      NAMESPACE: ${{ needs.build.outputs.namespace }}
+      TAG: ${{ needs.build.outputs.tag }}
+      IMAGE_BACKEND: ${{ needs.build.outputs.image_backend }}
+      IMAGE_FRONTEND: ${{ needs.build.outputs.image_frontend }}
+      OVERLAY: k8s/overlays/${{ needs.build.outputs.namespace }}
+      # Present -> deploy to that real cluster. Absent -> deploy to an
+      # ephemeral kind cluster on the runner (the local-only setup of this
+      # assessment), which still proves the manifests, images and rollout work.
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # KUBECONFIG_B64 is a base64-encoded kubeconfig stored as an encrypted
-      # GitHub Actions secret, scoped to a service account with access to
-      # only this cluster/namespace set - never printed or written to logs.
-      - name: Configure kubeconfig
+      - name: Target - real cluster from KUBECONFIG_B64
+        if: env.KUBECONFIG_B64 != ''
         run: |
-          mkdir -p "$HOME/.kube"
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          umask 077
+          mkdir -p ~/.kube
+          printf '%s' "$KUBECONFIG_B64" | base64 -d > ~/.kube/config
+          echo "TARGET=cluster" >> "$GITHUB_ENV"
 
-      - name: Deploy manifests to ${{ needs.build-and-push.outputs.namespace }}
+      - name: Target - ephemeral kind cluster
+        if: env.KUBECONFIG_B64 == ''
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.31.0
+          config: k8s/kind-config.yaml
+          cluster_name: node-react
+
+      - name: Install ingress-nginx (ephemeral cluster only)
+        if: env.KUBECONFIG_B64 == ''
+        run: |
+          echo "TARGET=kind" >> "$GITHUB_ENV"
+          helm upgrade --install ingress-nginx ingress-nginx \
+            --repo https://kubernetes.github.io/ingress-nginx --version 4.15.1 \
+            -n ingress-nginx --create-namespace -f terraform/values/ingress-nginx.yaml --wait --timeout 5m
+
+      # Secrets come from the GitHub Environment's secrets and are written to
+      # a git-ignored file that kustomize turns into a Secret. They are never
+      # echoed. An ephemeral cluster gets throwaway random values instead.
+      - name: Write app secrets
         env:
-          NAMESPACE: ${{ needs.build-and-push.outputs.namespace }}
-          TAG: ${{ needs.build-and-push.outputs.tag }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/manifests
-          cp k8s/*.yaml /tmp/manifests/
+          umask 077
+          for k in DB_PASSWORD; do
+            v="${!k:-}"
+            if [ -z "$v" ]; then
+              if [ "$TARGET" = cluster ]; then echo "::error::secret $k missing for $NAMESPACE"; exit 1; fi
+              v=$(openssl rand -hex 16)
+            fi
+            echo "::add-mask::$v"
+            echo "$k=$v" >> "$OVERLAY/secrets.env"
+          done
 
-          # Point the deployments at the image just built and pushed.
-          sed -i "s#ghcr.io/.*-backend:.*#${REGISTRY}/${IMAGE_BACKEND}:${TAG}#" /tmp/manifests/backend-deployment.yaml
-          sed -i "s#ghcr.io/.*-backend:.*#${REGISTRY}/${IMAGE_BACKEND}:${TAG}#" /tmp/manifests/bullmq-worker-deployment.yaml
-          sed -i "s#ghcr.io/.*-frontend:.*#${REGISTRY}/${IMAGE_FRONTEND}:${TAG}#" /tmp/manifests/frontend-deployment.yaml
+      - name: Pin overlay to the images built for this commit
+        run: |
+          cat >> "$OVERLAY/kustomization.yaml" <<EOF
 
-          # Re-target every manifest at the environment-specific namespace.
-          sed -i "s/namespace: dev/namespace: ${NAMESPACE}/" /tmp/manifests/*.yaml
+          images:
+            - name: node-react-backend
+              newName: ${IMAGE_BACKEND}
+              newTag: ${TAG}
+            - name: node-react-frontend
+              newName: ${IMAGE_FRONTEND}
+              newTag: ${TAG}
+          EOF
+          kubectl kustomize "$OVERLAY" | grep -E 'image: .*(backend|frontend)'
 
-          kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
-          kubectl apply -n "${NAMESPACE}" -f /tmp/manifests/
-          kubectl rollout status -n "${NAMESPACE}" deployment/backend --timeout=120s
-          kubectl rollout status -n "${NAMESPACE}" deployment/frontend --timeout=120s
+      # GHCR packages of a private repo are private: give the namespace a pull
+      # secret. On a long-lived cluster use a read:packages token
+      # (GHCR_PULL_TOKEN) - GITHUB_TOKEN expires when this job ends.
+      - name: Namespace + registry pull secret
+        env:
+          PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          kubectl apply --server-side -f "$OVERLAY/namespace-$NAMESPACE.yaml"
+          kubectl -n "$NAMESPACE" create secret docker-registry ghcr-pull \
+            --docker-server=ghcr.io --docker-username="${{ github.actor }}" --docker-password="$PULL_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$NAMESPACE" patch serviceaccount default \
+            -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
 
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          # Server-side apply: the API server tracks field ownership.
+          kubectl apply --server-side --force-conflicts -k "$OVERLAY"
+          kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=300s
+          kubectl -n "$NAMESPACE" rollout status deployment/backend --timeout=300s
+          kubectl -n "$NAMESPACE" rollout status deployment/frontend --timeout=180s
+
+      # End-to-end through the Ingress: Ingress -> Service -> Pod -> Postgres.
+      - name: Smoke test
+        if: env.TARGET == 'kind'
+        run: |
+          set -euo pipefail
+          HOST=$(kubectl -n "$NAMESPACE" get ingress api-ingress -o jsonpath='{.spec.rules[0].host}')
+          for _ in $(seq 1 30); do
+            curl -fsS -H "Host: $HOST" http://localhost/api/health/ready && break
+            sleep 5
+          done
+          curl -fsS -H "Host: $HOST" http://localhost/api/health/ready
+          curl -fsS -H "Host: $HOST" http://localhost/ | grep -q '<div id="root">'
+          curl -fsS -H "Host: $HOST" -H 'Content-Type: application/json' \
+            -d '{"name":"ci-smoke-test"}' http://localhost/api/items
+          curl -fsS -H "Host: $HOST" http://localhost/api/items | grep -q ci-smoke-test
+
+      # Automatic rollback: if the rollout or smoke test failed on a real
+      # cluster, return to the previous ReplicaSets.
+      - name: Roll back on failure
+        if: failure() && env.TARGET == 'cluster'
+        run: |
+          for d in backend frontend; do
+            kubectl -n "$NAMESPACE" rollout undo deployment/$d || true
+          done
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n "$NAMESPACE" get all,ingress,pvc,events --sort-by=.metadata.creationTimestamp || true
+          kubectl -n "$NAMESPACE" describe pods || true
+          kubectl -n "$NAMESPACE" logs -l app=backend --tail=100 --all-containers || true
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### Deployed \`$TAG\` to \`$NAMESPACE\` ($TARGET)"
+            echo '```'
+            kubectl -n "$NAMESPACE" get deploy,sts,ingress
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Manual rollback (Actions -> CI/CD -> Run workflow). Needs a real cluster.
+  #   image_tag set   -> redeploy that exact, previously built image
+  #   image_tag empty -> kubectl rollout undo (previous ReplicaSet)
   rollback:
-    if: github.event_name == 'workflow_dispatch' && inputs.rollback_namespace != ''
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      NAMESPACE: ${{ inputs.environment }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
     steps:
       - name: Configure kubeconfig
         run: |
-          mkdir -p "$HOME/.kube"
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          if [ -z "$KUBECONFIG_B64" ]; then
+            echo "::error::KUBECONFIG_B64 is not set for environment $NAMESPACE - nothing to roll back"; exit 1
+          fi
+          umask 077
+          mkdir -p ~/.kube
+          printf '%s' "$KUBECONFIG_B64" | base64 -d > ~/.kube/config
 
-      # Fast path: undo the last rollout. The slower/more precise path is
-      # re-running this workflow with a previous commit checked out, which
-      # rebuilds and redeploys that exact previous image tag.
-      - name: Roll back last deployment
-        env:
-          NAMESPACE: ${{ inputs.rollback_namespace }}
+      - name: Roll back
         run: |
-          kubectl rollout undo -n "${NAMESPACE}" deployment/backend
-          kubectl rollout undo -n "${NAMESPACE}" deployment/frontend
+          set -euo pipefail
+          REPO=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          if [ -n "$IMAGE_TAG" ]; then
+            kubectl -n "$NAMESPACE" set image deployment/backend backend="$REGISTRY/$REPO-backend:$IMAGE_TAG"
+            kubectl -n "$NAMESPACE" set image deployment/frontend frontend="$REGISTRY/$REPO-frontend:$IMAGE_TAG"
+          else
+            for d in backend frontend; do kubectl -n "$NAMESPACE" rollout undo deployment/$d; done
+          fi
+          for d in backend frontend; do
+            kubectl -n "$NAMESPACE" rollout status deployment/$d --timeout=180s
+          done
