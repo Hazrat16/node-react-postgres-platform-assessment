@@ -15,7 +15,7 @@ help: ## Show targets
 # ---- Docker Compose (Task 1) -------------------------------------------------
 env: ## Create .env with random passwords (if missing)
 	@test -f .env || { cp .env.example .env; \
-	  for k in DB_PASSWORD; do \
+	  for k in DB_PASSWORD REPLICATION_PASSWORD REDIS_PASSWORD; do \
 	    sed -i "s/^$$k=.*/$$k=$$(openssl rand -hex 16)/" .env; done; \
 	  echo "created .env"; }
 
@@ -48,7 +48,7 @@ cluster-destroy: ## Delete the cluster
 
 secrets: ## Generate k8s/overlays/$(ENV)/secrets.env with random passwords (if missing)
 	@test -f $(OVERLAY)/secrets.env || { \
-	  for k in DB_PASSWORD; do echo "$$k=$$(openssl rand -hex 16)"; done \
+	  for k in DB_PASSWORD REPLICATION_PASSWORD REDIS_PASSWORD; do echo "$$k=$$(openssl rand -hex 16)"; done \
 	  > $(OVERLAY)/secrets.env; echo "created $(OVERLAY)/secrets.env"; }
 
 images: ## Build images and load them into kind
@@ -59,8 +59,10 @@ images: ## Build images and load them into kind
 deploy: secrets ## Apply the $(ENV) overlay and wait for rollouts
 	kubectl apply --server-side --force-conflicts -k $(OVERLAY)
 	kubectl -n $(ENV) rollout status statefulset/postgres --timeout=180s
+	kubectl -n $(ENV) rollout status statefulset/postgres-replica --timeout=300s
 	kubectl -n $(ENV) rollout status deployment/backend --timeout=180s
 	kubectl -n $(ENV) rollout status deployment/frontend --timeout=120s
+	kubectl -n $(ENV) rollout status deployment/bullmq-worker --timeout=120s
 
 k8s-up: cluster images deploy hosts ## Everything: cluster + ingress + app in dev
 
@@ -69,4 +71,4 @@ hosts: ## Print the /etc/hosts line needed for the Ingress hostnames
 	@echo "127.0.0.1 node-react.local preprod.node-react.local release.node-react.local"
 
 status: ## kubectl get all in $(ENV)
-	kubectl get all,ingress,pvc -n $(ENV)
+	kubectl get all,ingress,pvc,networkpolicy -n $(ENV)
