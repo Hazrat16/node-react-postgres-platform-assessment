@@ -270,6 +270,10 @@ jobs:
           helm upgrade --install ingress-nginx ingress-nginx \
             --repo https://kubernetes.github.io/ingress-nginx --version 4.15.1 \
             -n ingress-nginx --create-namespace -f terraform/values/ingress-nginx.yaml --wait --timeout 5m
+          # `helm --wait` can return before the admission webhook answers;
+          # applying an Ingress before that fails with "connection refused".
+          kubectl -n ingress-nginx wait --for=condition=ready pod \
+            -l app.kubernetes.io/component=controller --timeout=180s
 
       # Secrets come from the GitHub Environment's secrets and are written to
       # a git-ignored file that kustomize turns into a Secret. They are never
@@ -322,7 +326,13 @@ jobs:
         run: |
           set -euo pipefail
           # Server-side apply: the API server tracks field ownership.
-          kubectl apply --server-side --force-conflicts -k "$OVERLAY"
+          # Retried: right after the controller starts, the ingress admission
+          # webhook endpoint can take a few seconds to become reachable.
+          for attempt in 1 2 3; do
+            kubectl apply --server-side --force-conflicts -k "$OVERLAY" && break
+            [ "$attempt" = 3 ] && exit 1
+            echo "apply failed (attempt $attempt), retrying in 10s"; sleep 10
+          done
           kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=300s
           kubectl -n "$NAMESPACE" rollout status deployment/backend --timeout=300s
           kubectl -n "$NAMESPACE" rollout status deployment/frontend --timeout=180s
@@ -355,7 +365,8 @@ jobs:
       - name: Diagnostics on failure
         if: failure()
         run: |
-          kubectl -n "$NAMESPACE" get all,ingress,pvc,events --sort-by=.metadata.creationTimestamp || true
+          kubectl -n "$NAMESPACE" get all,ingress,pvc || true
+          kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp || true
           kubectl -n "$NAMESPACE" describe pods || true
           kubectl -n "$NAMESPACE" logs -l app=backend --tail=100 --all-containers || true
 
