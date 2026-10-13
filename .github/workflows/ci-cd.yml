@@ -96,6 +96,7 @@ jobs:
             kubectl kustomize k8s/overlays/$env \
               | kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.35.0
           done
+          kubectl kustomize observability | kubeconform -strict -summary -ignore-missing-schemas
 
       - name: Validate docker-compose.yml
         run: cp .env.example .env && docker compose config --quiet
@@ -263,7 +264,7 @@ jobs:
           config: k8s/kind-config.yaml
           cluster_name: node-react
 
-      - name: Install ingress-nginx (ephemeral cluster only)
+      - name: Install ingress-nginx + metrics-server (ephemeral cluster only)
         if: env.KUBECONFIG_B64 == ''
         run: |
           echo "TARGET=kind" >> "$GITHUB_ENV"
@@ -274,6 +275,9 @@ jobs:
           # applying an Ingress before that fails with "connection refused".
           kubectl -n ingress-nginx wait --for=condition=ready pod \
             -l app.kubernetes.io/component=controller --timeout=180s
+          helm upgrade --install metrics-server metrics-server \
+            --repo https://kubernetes-sigs.github.io/metrics-server/ --version 3.14.0 \
+            -n kube-system -f terraform/values/metrics-server.yaml
 
       # Secrets come from the GitHub Environment's secrets and are written to
       # a git-ignored file that kustomize turns into a Secret. They are never
@@ -327,7 +331,8 @@ jobs:
       - name: Deploy
         run: |
           set -euo pipefail
-          # Server-side apply: the API server tracks field ownership.
+          # Server-side apply: the API server tracks field ownership, so fields
+          # owned by controllers (e.g. replicas, owned by the HPA) are left alone.
           # Retried: right after the controller starts, the ingress admission
           # webhook endpoint can take a few seconds to become reachable.
           for attempt in 1 2 3; do
@@ -381,7 +386,7 @@ jobs:
           {
             echo "### Deployed \`$TAG\` to \`$NAMESPACE\` ($TARGET)"
             echo '```'
-            kubectl -n "$NAMESPACE" get deploy,sts,ingress
+            kubectl -n "$NAMESPACE" get deploy,sts,hpa,ingress
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

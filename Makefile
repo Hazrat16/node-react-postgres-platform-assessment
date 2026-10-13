@@ -3,11 +3,11 @@
 SHELL := /bin/bash
 ENV ?= dev
 CLUSTER ?= node-react
-OVERLAY := k8s/overlays/$(ENV)
 # Host port for the Ingress (use e.g. HTTP_PORT=8880 if something already listens on 80)
 HTTP_PORT ?= 80
+OVERLAY := k8s/overlays/$(ENV)
 
-.PHONY: help env up down logs test cluster cluster-kind cluster-destroy secrets images deploy k8s-up hosts status
+.PHONY: help env up down logs test cluster cluster-kind cluster-destroy secrets images deploy observability k8s-up hosts load-test load-test-clean rate-limit-test status
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -34,14 +34,17 @@ test: ## Run backend tests + frontend build
 	cd frontend && npm ci && npm run build
 
 # ---- Kubernetes (Tasks 2-6) --------------------------------------------------
-cluster: ## Create kind cluster + ingress-nginx (Terraform)
+cluster: ## Create kind cluster + ingress, metrics-server, Prometheus/Grafana, Loki, Fluent Bit (Terraform)
 	terraform -chdir=terraform init -upgrade
 	terraform -chdir=terraform apply -auto-approve -var ingress_http_port=$(HTTP_PORT)
+	kubectl apply --server-side --force-conflicts -k observability/
 
-cluster-kind: ## Alternative without Terraform: plain kind + ingress-nginx
+cluster-kind: ## Alternative without Terraform: plain kind + ingress-nginx + metrics-server only
 	kind create cluster --config k8s/kind-config.yaml
 	helm upgrade --install ingress-nginx ingress-nginx --repo https://kubernetes.github.io/ingress-nginx \
 	  --version 4.15.1 -n ingress-nginx --create-namespace -f terraform/values/ingress-nginx.yaml --wait
+	helm upgrade --install metrics-server metrics-server --repo https://kubernetes-sigs.github.io/metrics-server/ \
+	  --version 3.14.0 -n kube-system -f terraform/values/metrics-server.yaml --wait
 
 cluster-destroy: ## Delete the cluster
 	terraform -chdir=terraform destroy -auto-approve || kind delete cluster --name $(CLUSTER)
@@ -64,11 +67,25 @@ deploy: secrets ## Apply the $(ENV) overlay and wait for rollouts
 	kubectl -n $(ENV) rollout status deployment/frontend --timeout=120s
 	kubectl -n $(ENV) rollout status deployment/bullmq-worker --timeout=120s
 
-k8s-up: cluster images deploy hosts ## Everything: cluster + ingress + app in dev
+observability: ## (Re)apply ServiceMonitor, alert rules, Grafana dashboard
+	kubectl apply --server-side --force-conflicts -k observability/
+
+k8s-up: cluster images deploy hosts ## Everything: cluster + platform + app in dev
 
 hosts: ## Print the /etc/hosts line needed for the Ingress hostnames
 	@echo "Add this to /etc/hosts (once):"
-	@echo "127.0.0.1 node-react.local preprod.node-react.local release.node-react.local"
+	@echo "127.0.0.1 node-react.local preprod.node-react.local release.node-react.local grafana.node-react.local prometheus.node-react.local"
 
 status: ## kubectl get all in $(ENV)
-	kubectl get all,ingress,pvc,networkpolicy -n $(ENV)
+	kubectl get all,ingress,pvc,hpa,networkpolicy -n $(ENV)
+
+load-test: ## Generate CPU load on the backend from inside the cluster to trigger the HPA
+	kubectl -n $(ENV) delete pod load-generator --ignore-not-found
+	kubectl -n $(ENV) apply -f k8s/tools/load-test.yaml
+	@echo "watch: kubectl -n $(ENV) get hpa backend-hpa -w"
+
+load-test-clean: ## Remove the load generator and its NetworkPolicy
+	kubectl -n $(ENV) delete -f k8s/tools/load-test.yaml --ignore-not-found
+
+rate-limit-test: ## Fire 300 requests through the Ingress and count status codes (expect 429s)
+	@for i in $$(seq 1 300); do curl -s -o /dev/null -w '%{http_code}\n' --resolve node-react.local:$(HTTP_PORT):127.0.0.1 http://node-react.local:$(HTTP_PORT)/api/health & done | sort | uniq -c; wait

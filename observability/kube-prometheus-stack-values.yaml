@@ -1,0 +1,66 @@
+# Prometheus + Alertmanager + Grafana + kube-state-metrics + node-exporter.
+# kube-state-metrics provides replica counts (HPA dashboard), cAdvisor via
+# the kubelet provides per-container CPU/memory.
+
+# kind runs these control-plane components without exposed metrics endpoints;
+# scraping them would only produce permanently-down targets and noise alerts.
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheus:
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts: [prometheus.node-react.local]
+  prometheusSpec:
+    # Pick up every ServiceMonitor / PrometheusRule in the cluster, not only
+    # those labelled with this Helm release.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeInterval: 15s
+    retention: 3d
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        memory: 1536Mi
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+
+grafana:
+  admin:
+    existingSecret: grafana-admin # created by Terraform (random password)
+    userKey: admin-user
+    passwordKey: admin-password
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts: [grafana.node-react.local]
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      searchNamespace: ALL
+  additionalDataSources:
+    - name: Loki
+      uid: loki
+      type: loki
+      access: proxy
+      url: http://loki.logging.svc.cluster.local:3100
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi

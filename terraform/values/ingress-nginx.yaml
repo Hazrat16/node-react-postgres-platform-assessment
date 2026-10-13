@@ -18,6 +18,18 @@ controller:
       maxUnavailable: 1 # hostPort: old pod must go before the new one binds
   ingressClassResource:
     default: true
+  config:
+    # Rate-limited requests get 429 Too Many Requests instead of the default 503,
+    # so clients (and dashboards) can tell throttling apart from outages.
+    limit-req-status-code: "429"
+    limit-conn-status-code: "429"
+    # JSON access logs -> easy filtering in Loki (| json | status >= 500).
+    log-format-escape-json: "true"
+    log-format-upstream: '{"time":"$time_iso8601","remote_addr":"$remote_addr","host":"$host","method":"$request_method","path":"$uri","status":$status,"bytes":$bytes_sent,"request_time":$request_time,"upstream":"$proxy_upstream_name","upstream_status":"$upstream_status","request_id":"$req_id"}'
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false # switched on by Terraform once the CRD exists
   resources:
     requests:
       cpu: 100m

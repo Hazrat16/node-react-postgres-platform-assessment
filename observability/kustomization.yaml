@@ -1,0 +1,21 @@
+# Cluster-level observability objects that live next to the Helm releases:
+# the backend ServiceMonitor, alert rules and the Grafana dashboard.
+# Apply after Terraform: `kubectl apply -k observability/`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: monitoring
+
+resources:
+  - servicemonitor-backend.yaml
+  - prometheusrule-backend.yaml
+
+# Grafana's sidecar loads any ConfigMap labelled grafana_dashboard=1.
+configMapGenerator:
+  - name: backend-dashboard
+    files:
+      - dashboards/backend-dashboard.json
+    options:
+      disableNameSuffixHash: true
+      labels:
+        grafana_dashboard: "1"

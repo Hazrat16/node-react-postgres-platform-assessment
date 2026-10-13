@@ -28,10 +28,20 @@ variable "ingress_https_port" {
   default     = 443
 }
 
+variable "enable_observability" {
+  description = "Install Prometheus/Grafana, Loki and Fluent Bit"
+  type        = bool
+  default     = true
+}
+
 # Chart versions are pinned so `terraform apply` is reproducible.
 variable "chart_versions" {
   type = map(string)
   default = {
-    ingress_nginx = "4.15.1"
+    ingress_nginx         = "4.15.1"
+    metrics_server        = "3.14.0"
+    kube_prometheus_stack = "92.3.0"
+    loki                  = "7.3.0"
+    fluent_bit            = "0.58.3"
   }
 }

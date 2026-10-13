@@ -100,3 +100,8 @@ test("POST /api/items writes to the primary and enqueues an event", async () => 
   const list = await (await fetch(`${base}/api/items`)).json();
   assert.equal(list[0].name, "first item");
 });
+
+test("/metrics exposes request counters with route labels", async () => {
+  const body = await (await fetch(`${base}/metrics`)).text();
+  assert.match(body, /http_requests_total\{method="POST",route="\/api\/items",status="201"\}/);
+});

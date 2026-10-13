@@ -1,5 +1,5 @@
 # Ingress = the API gateway. Two Ingress objects on the same host so the API
-# can carry its own policy (body size, timeouts) without affecting static assets.
+# can carry its own policy (rate limiting) without affecting static assets.
 #   /      -> frontend-service
 #   /api/* -> backend-service
 apiVersion: networking.k8s.io/v1
@@ -25,6 +25,11 @@ kind: Ingress
 metadata:
   name: api-ingress
   annotations:
+    # Per client IP, per ingress-controller replica. Limits are explained in
+    # the README (Task 6 - rate limiting). Excess requests get HTTP 429.
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
     nginx.ingress.kubernetes.io/proxy-body-size: 1m
     nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
 spec:

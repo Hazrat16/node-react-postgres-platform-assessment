@@ -1,0 +1,77 @@
+# Alerts. Reasoning for each is in the README (Task 6 - alerting).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: backend-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: backend.rules
+      rules:
+        # Users are getting errors. The ratio (not the count) stays
+        # meaningful at any traffic level.
+        - alert: BackendHighErrorRate
+          expr: |
+            sum by (namespace) (rate(http_requests_total{job="backend-service",status=~"5.."}[5m]))
+              /
+            sum by (namespace) (rate(http_requests_total{job="backend-service"}[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Backend 5xx ratio above 5% in {{ $labels.namespace }}"
+
+        # Users are waiting. Catches slow queries / a struggling dependency
+        # before they turn into errors.
+        - alert: BackendHighLatencyP95
+          expr: |
+            histogram_quantile(0.95,
+              sum by (namespace, le) (rate(http_request_duration_seconds_bucket{job="backend-service",route!="/metrics"}[5m]))
+            ) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Backend p95 latency above 500ms in {{ $labels.namespace }}"
+
+        # Nothing is serving traffic.
+        - alert: BackendNoReadyPods
+          expr: kube_deployment_status_replicas_available{deployment="backend"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No ready backend pods in {{ $labels.namespace }}"
+
+        # The autoscaler has no headroom left: the next symptom is latency.
+        - alert: BackendHPAAtMaxReplicas
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="backend-hpa"}
+              >= kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler="backend-hpa"}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Backend HPA pinned at max replicas in {{ $labels.namespace }}"
+
+        # Sustained CPU close to the limit means throttling (and the HPA is
+        # not keeping up).
+        - alert: BackendHighCPU
+          expr: |
+            sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{container="backend"}[5m]))
+              /
+            sum by (namespace, pod) (kube_pod_container_resource_limits{container="backend",resource="cpu"}) > 0.85
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Backend pod {{ $labels.pod }} using >85% of its CPU limit"
+
+        # Crash loops (bad config, OOMKilled) are invisible to error-rate
+        # alerts while other replicas still serve traffic.
+        - alert: BackendRestarting
+          expr: increase(kube_pod_container_status_restarts_total{container="backend"}[15m]) > 3
+          labels:
+            severity: warning
+          annotations:
+            summary: "Backend pod {{ $labels.pod }} restarted more than 3 times in 15m"
