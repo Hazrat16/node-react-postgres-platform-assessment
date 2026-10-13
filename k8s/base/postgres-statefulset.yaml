@@ -1,4 +1,4 @@
-# PostgreSQL. A StatefulSet rather than a Deployment:
+# PostgreSQL primary (the "writer"). A StatefulSet rather than a Deployment:
 # stable identity and at most one pod at a time on the volume.
 apiVersion: apps/v1
 kind: StatefulSet
@@ -27,6 +27,7 @@ spec:
       containers:
         - name: postgres
           image: postgres:17-alpine
+          args: ["postgres", "-c", "wal_keep_size=256MB"]
           ports:
             - name: postgres
               containerPort: 5432
@@ -46,6 +47,11 @@ spec:
                 secretKeyRef:
                   name: app-secrets
                   key: DB_PASSWORD
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: REPLICATION_PASSWORD
             # Subdirectory so initdb doesn't trip over lost+found on real disks.
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
@@ -74,7 +80,16 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: postgres-pvc
+        - name: init-scripts
+          configMap:
+            name: postgres-scripts
+            items:
+              - key: primary-init.sh
+                path: 10-replication.sh

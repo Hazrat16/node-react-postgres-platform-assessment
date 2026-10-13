@@ -17,10 +17,26 @@ resources:
   # frontend
   - frontend-deployment.yaml
   - frontend-service.yaml
-  # postgres
+  # postgres primary + streaming read replica
   - postgres-statefulset.yaml
   - postgres-service.yaml
   - postgres-pvc.yaml
+  - postgres-replica-statefulset.yaml
+  - postgres-read-service.yaml
+  # platform services
+  - redis-deployment.yaml
+  - redis-service.yaml
+  - bullmq-worker-deployment.yaml
+  - search-deployment.yaml
+  - search-service.yaml
+  # isolation
+  - networkpolicies.yaml
+
+configMapGenerator:
+  - name: postgres-scripts
+    files:
+      - postgres-scripts/primary-init.sh
+      - postgres-scripts/replica-entrypoint.sh
 
 # Image names are placeholders for locally built images; CI pins them per
 # overlay to ghcr.io/...:<branch>-<sha> (see .github/workflows/ci-cd.yml).

@@ -1,0 +1,84 @@
+# Streaming read replica (the "reader"). Clones the primary on first start,
+# then follows its WAL as a read-only hot standby. Storage comes from the
+# cluster's default StorageClass via volumeClaimTemplates (kind: local-path).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-replica
+  labels:
+    app: postgres
+    role: replica
+spec:
+  serviceName: postgres-read-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+      role: replica
+  template:
+    metadata:
+      labels:
+        app: postgres
+        role: replica
+        tier: data
+    spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          command: ["sh", "/scripts/replica-entrypoint.sh"]
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: PRIMARY_HOST
+              value: postgres-service
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: REPLICATION_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          # Liveness/readiness only start once this succeeds, so a slow first
+          # start (first start waits for the primary + base backup) is never killed.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+            periodSeconds: 5
+            failureThreshold: 120 # up to 10 minutes
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: postgres-scripts
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

@@ -1,0 +1,16 @@
+# Reader endpoint (DB_READ_URL). Add more replicas behind it to scale reads.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-read-service
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+    role: replica
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

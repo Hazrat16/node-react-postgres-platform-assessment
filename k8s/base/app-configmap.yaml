@@ -1,5 +1,5 @@
-# Non-secret backend configuration. The password lives in the app-secrets
-# Secret (generated per overlay).
+# Non-secret configuration shared by the backend and the worker.
+# Passwords live in the app-secrets Secret (generated per overlay).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,6 +8,9 @@ data:
   NODE_ENV: production
   PORT: "4000"
   DB_HOST: postgres-service
+  DB_READ_HOST: postgres-read-service
   DB_PORT: "5432"
   DB_NAME: appdb
   DB_USER: appuser
+  REDIS_HOST: redis-service
+  SEARCH_URL: http://search-service:9200
