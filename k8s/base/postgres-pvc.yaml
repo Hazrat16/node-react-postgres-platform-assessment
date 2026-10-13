@@ -1,0 +1,12 @@
+# Claims the statically provisioned PV from the overlay (postgres-pv.yaml).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi

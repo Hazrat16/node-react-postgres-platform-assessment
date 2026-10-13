@@ -1,0 +1,30 @@
+# Environment-agnostic base. Overlays (k8s/overlays/<env>) add the namespace,
+# the Postgres PV and secrets.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: node-react-platform
+    includeSelectors: false
+
+resources:
+  - app-configmap.yaml
+  # backend
+  - backend-deployment.yaml
+  - backend-service.yaml
+  - backend-pdb.yaml
+  # frontend
+  - frontend-deployment.yaml
+  - frontend-service.yaml
+  # postgres
+  - postgres-statefulset.yaml
+  - postgres-service.yaml
+  - postgres-pvc.yaml
+
+# Image names are placeholders for locally built images (`make images`).
+images:
+  - name: node-react-backend
+    newTag: local
+  - name: node-react-frontend
+    newTag: local

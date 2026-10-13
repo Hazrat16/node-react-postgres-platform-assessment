@@ -1,0 +1,11 @@
+# Keeps at least one backend pod up during voluntary disruptions
+# (node drains, cluster upgrades).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: backend
