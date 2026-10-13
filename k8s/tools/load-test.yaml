@@ -1,0 +1,36 @@
+# Load generator for the HPA demo (`make load-test`). Calls backend-service
+# directly from inside the cluster, so the Ingress rate limit doesn't cap it.
+# Not part of any overlay; removed again with `make load-test-clean`.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-from-load-test
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: load-generator
+      ports:
+        - port: 4000
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: load-generator
+  labels:
+    app: load-generator
+spec:
+  restartPolicy: Never
+  containers:
+    - name: hey
+      image: williamyeh/hey:latest
+      args: ["-z", "3m", "-c", "50", "http://backend-service:4000/api/items"]
+      resources:
+        limits:
+          cpu: 500m
+          memory: 128Mi

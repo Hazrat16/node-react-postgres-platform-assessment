@@ -1,5 +1,5 @@
 # Environment-agnostic base. Overlays (k8s/overlays/<env>) add the namespace,
-# the Postgres PV, the Ingress and secrets.
+# the Postgres PV, the Ingress, secrets and per-environment sizing.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -14,6 +14,7 @@ resources:
   - backend-deployment.yaml
   - backend-service.yaml
   - backend-pdb.yaml
+  - hpa-backend.yaml
   # frontend
   - frontend-deployment.yaml
   - frontend-service.yaml

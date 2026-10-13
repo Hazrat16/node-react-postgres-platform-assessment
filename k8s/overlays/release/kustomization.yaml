@@ -20,3 +20,15 @@ secretGenerator:
   - name: app-secrets
     envs:
       - secrets.env
+
+patches:
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: backend-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10

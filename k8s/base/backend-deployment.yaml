@@ -5,7 +5,8 @@ metadata:
   labels:
     app: backend
 spec:
-  replicas: 2
+  # No `replicas` here on purpose: the HPA (hpa-backend.yaml, min 2) owns the
+  # replica count. Setting it would reset a scaled-up backend on every deploy.
   revisionHistoryLimit: 5 # old ReplicaSets kept for `kubectl rollout undo`
   selector:
     matchLabels:
