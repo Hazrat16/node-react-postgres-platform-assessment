@@ -1,0 +1,13 @@
+# Non-secret backend configuration. The password lives in the app-secrets
+# Secret (generated per overlay).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  NODE_ENV: production
+  PORT: "4000"
+  DB_HOST: postgres-service
+  DB_PORT: "5432"
+  DB_NAME: appdb
+  DB_USER: appuser

@@ -1,0 +1,20 @@
+# Local cluster: 1 control-plane + 2 workers.
+# The frontend NodePort (30080) is mapped to the host, so the UI is at
+# http://localhost:30080.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: node-react
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.35.0
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+  - role: worker
+    image: kindest/node:v1.35.0
+    labels:
+      # The Postgres hostPath PV is pinned to this node (see postgres-pv.yaml).
+      node-react/storage: "true"
+  - role: worker
+    image: kindest/node:v1.35.0

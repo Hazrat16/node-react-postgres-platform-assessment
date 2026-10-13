@@ -1,0 +1,17 @@
+# Internal only: reachable inside the cluster as
+# backend-service.<namespace>.svc.cluster.local. External traffic only reaches
+# it through the frontend's nginx proxy, never directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  labels:
+    app: backend
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http
