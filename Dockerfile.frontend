@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+
+# ---- build: compile the React app into static files ------------------------
+FROM node:24-alpine AS build
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY frontend/ ./
+# Vite inlines VITE_* variables at build time. "/api" (same-origin) is the
+# default because nginx / the Ingress route /api to the backend.
+ARG VITE_API_BASE_URL=/api
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+RUN npm run build
+
+# ---- runtime: static files served by unprivileged nginx (port 8080) --------
+FROM nginxinc/nginx-unprivileged:1.30-alpine AS runtime
+# Templates are rendered with envsubst on startup -> BACKEND_URL is runtime config.
+COPY frontend/nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=build /app/dist /usr/share/nginx/html
+ENV BACKEND_URL=http://backend:4000
+EXPOSE 8080

@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+
+# ---- deps: install production dependencies only ----------------------------
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY backend/package.json backend/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+
+# ---- runtime: node + prod node_modules + source, nothing else --------------
+FROM node:24-alpine AS runtime
+ENV NODE_ENV=production
+WORKDIR /app
+# Files stay root-owned (read-only for the app user); the process runs as the
+# unprivileged "node" user that ships with the base image.
+COPY --from=deps /app/node_modules ./node_modules
+COPY backend/package.json ./
+COPY backend/src ./src
+USER node
+EXPOSE 4000
+# Same image runs the API (default) and the BullMQ worker (`node src/worker.js`).
+CMD ["node", "src/server.js"]

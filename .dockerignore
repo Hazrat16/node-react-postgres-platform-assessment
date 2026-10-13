@@ -1,0 +1,15 @@
+# Build context is the repo root; only backend/ and frontend/ sources are needed.
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+**/*.log
+.git
+.github
+k8s
+observability
+terraform
+docs
+*.md
+docker-compose*.yml
+Dockerfile.*
