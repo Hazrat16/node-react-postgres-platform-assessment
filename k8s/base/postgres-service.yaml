@@ -1,4 +1,4 @@
-# Internal only.
+# Writer endpoint (DB_WRITE_URL). Internal only.
 apiVersion: v1
 kind: Service
 metadata:

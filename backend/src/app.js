@@ -43,6 +43,20 @@ export function createApp({ db, redis, queue, search, isReady = () => true }) {
     }
   });
 
+  app.get("/api/health/db", async (req, res) => {
+    try {
+      await db.pingWrite();
+      const replica = await db.replicaStatus();
+      res.json({
+        primary: "ok",
+        read_target_is_replica: replica.in_recovery,
+        replication_lag_seconds: replica.lag_seconds === null ? null : Number(replica.lag_seconds),
+      });
+    } catch (err) {
+      res.status(503).json({ status: "error", error: err.message });
+    }
+  });
+
   app.get("/api/health/redis", async (req, res) => {
     if (!redis) return res.status(503).json({ status: "disabled" });
     try {
@@ -76,8 +90,9 @@ export function createApp({ db, redis, queue, search, isReady = () => true }) {
     }
   });
 
-  // Write to the primary, then publish an event for async processing (when
-  // the queue is configured).
+  // Write to the primary, then publish an event. The worker indexes the item
+  // into OpenSearch asynchronously, so a slow search cluster never slows down
+  // the write path.
   app.post("/api/items", async (req, res) => {
     const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
     if (!name) return res.status(400).json({ error: "name is required" });
@@ -95,6 +110,18 @@ export function createApp({ db, redis, queue, search, isReady = () => true }) {
     } catch (err) {
       log.error("create item failed", { error: err.message });
       res.status(500).json({ error: "failed to create item" });
+    }
+  });
+
+  app.get("/api/search", async (req, res) => {
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    if (!q) return res.status(400).json({ error: "q is required" });
+    if (!search) return res.status(503).json({ error: "search disabled" });
+    try {
+      res.json(await search.searchItems(q));
+    } catch (err) {
+      log.error("search failed", { error: err.message });
+      res.status(502).json({ error: "search unavailable" });
     }
   });
 

@@ -51,6 +51,19 @@ spec:
                 secretKeyRef:
                   name: app-secrets
                   key: DB_PASSWORD
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: REDIS_PASSWORD
+            # Composed from the variables above ($(VAR) expansion), so the
+            # password is never written into a ConfigMap.
+            - name: DB_WRITE_URL
+              value: postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)
+            - name: DB_READ_URL
+              value: postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_READ_HOST):$(DB_PORT)/$(DB_NAME)
+            - name: REDIS_URL
+              value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):6379
           # Readiness: gates traffic. Fails when the primary DB is unreachable,
           # so the Service stops sending requests to this pod.
           readinessProbe:

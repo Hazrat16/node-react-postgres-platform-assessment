@@ -281,10 +281,12 @@ jobs:
       - name: Write app secrets
         env:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          REPLICATION_PASSWORD: ${{ secrets.REPLICATION_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
         run: |
           set -euo pipefail
           umask 077
-          for k in DB_PASSWORD; do
+          for k in DB_PASSWORD REPLICATION_PASSWORD REDIS_PASSWORD; do
             v="${!k:-}"
             if [ -z "$v" ]; then
               if [ "$TARGET" = cluster ]; then echo "::error::secret $k missing for $NAMESPACE"; exit 1; fi
@@ -334,8 +336,10 @@ jobs:
             echo "apply failed (attempt $attempt), retrying in 10s"; sleep 10
           done
           kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=300s
+          kubectl -n "$NAMESPACE" rollout status statefulset/postgres-replica --timeout=300s
           kubectl -n "$NAMESPACE" rollout status deployment/backend --timeout=300s
           kubectl -n "$NAMESPACE" rollout status deployment/frontend --timeout=180s
+          kubectl -n "$NAMESPACE" rollout status deployment/bullmq-worker --timeout=180s
 
       # End-to-end through the Ingress: Ingress -> Service -> Pod -> Postgres.
       - name: Smoke test
@@ -352,13 +356,14 @@ jobs:
           curl -fsS -H "Host: $HOST" -H 'Content-Type: application/json' \
             -d '{"name":"ci-smoke-test"}' http://localhost/api/items
           curl -fsS -H "Host: $HOST" http://localhost/api/items | grep -q ci-smoke-test
+          curl -fsS -H "Host: $HOST" http://localhost/api/health/db
 
       # Automatic rollback: if the rollout or smoke test failed on a real
       # cluster, return to the previous ReplicaSets.
       - name: Roll back on failure
         if: failure() && env.TARGET == 'cluster'
         run: |
-          for d in backend frontend; do
+          for d in backend frontend bullmq-worker; do
             kubectl -n "$NAMESPACE" rollout undo deployment/$d || true
           done
 
@@ -411,10 +416,11 @@ jobs:
           REPO=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           if [ -n "$IMAGE_TAG" ]; then
             kubectl -n "$NAMESPACE" set image deployment/backend backend="$REGISTRY/$REPO-backend:$IMAGE_TAG"
+            kubectl -n "$NAMESPACE" set image deployment/bullmq-worker worker="$REGISTRY/$REPO-backend:$IMAGE_TAG"
             kubectl -n "$NAMESPACE" set image deployment/frontend frontend="$REGISTRY/$REPO-frontend:$IMAGE_TAG"
           else
-            for d in backend frontend; do kubectl -n "$NAMESPACE" rollout undo deployment/$d; done
+            for d in backend frontend bullmq-worker; do kubectl -n "$NAMESPACE" rollout undo deployment/$d; done
           fi
-          for d in backend frontend; do
+          for d in backend frontend bullmq-worker; do
             kubectl -n "$NAMESPACE" rollout status deployment/$d --timeout=180s
           done

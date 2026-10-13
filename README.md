@@ -13,8 +13,9 @@ end shows what is done and what comes next.
 5. [Task 2 — Kubernetes](#task-2--kubernetes)
 6. [Task 3 — Ingress as API gateway](#task-3--ingress-as-api-gateway)
 7. [Task 4 — CI/CD & multi-environment deployment](#task-4--cicd--multi-environment-deployment)
-8. [Design decisions & trade-offs](#design-decisions--trade-offs)
-9. [Roadmap](#roadmap)
+8. [Task 5 — Platform services](#task-5--platform-services)
+9. [Design decisions & trade-offs](#design-decisions--trade-offs)
+10. [Roadmap](#roadmap)
 
 ---
 
@@ -29,11 +30,12 @@ end shows what is done and what comes next.
 | Helm | 3 or 4 | only for `make cluster-kind` (no-Terraform path) |
 | Node.js | 24 | only to run tests outside Docker |
 
-Resources: Compose needs ~1 GB RAM; the Kubernetes setup needs ~3 GB free RAM.
+Resources: Compose needs ~2.5 GB RAM (OpenSearch alone takes 1 GB); the Kubernetes setup
+needs ~4 GB free RAM.
 
 ## Quick start
 
-### Docker Compose (Task 1)
+### Docker Compose (Task 1 + 5)
 
 ```bash
 cp .env.example .env          # or `make env` to generate random passwords
@@ -43,7 +45,7 @@ docker compose up --build     # or `make up`
 - UI: http://localhost:8080
 - API (debug only, bound to 127.0.0.1): http://localhost:4000/api/health
 
-### Kubernetes (Tasks 2–4)
+### Kubernetes (Tasks 2–5)
 
 ```bash
 make k8s-up
@@ -75,7 +77,7 @@ Other useful targets: `make help`, `make status`,
 ├── Dockerfile.backend          multi-stage, non-root
 ├── Dockerfile.frontend         multi-stage, unprivileged nginx
 ├── .dockerignore
-├── docker-compose.yml          frontend + backend + Postgres
+├── docker-compose.yml          app + Postgres primary/replica + Redis + worker + OpenSearch
 ├── .env.example                Compose config template (.env is git-ignored)
 ├── Makefile                    thin wrappers around the commands in this README
 ├── k8s/
@@ -93,17 +95,19 @@ Mapping from the file names suggested in the brief to this repo:
 | `namespace-dev.yaml` | `k8s/overlays/dev/namespace-dev.yaml` | one per environment |
 | `backend-deployment.yaml`, `backend-service.yaml` | `k8s/base/` | + `backend-pdb.yaml` |
 | `frontend-deployment.yaml`, `frontend-service.yaml` | `k8s/base/` | |
-| `postgres-statefulset.yaml`, `postgres-service.yaml` | `k8s/base/` | |
+| `postgres-statefulset.yaml`, `postgres-service.yaml` | `k8s/base/` | + replica StatefulSet and `postgres-read-service.yaml` |
 | `postgres-pv.yaml` / `postgres-pvc.yaml` | `k8s/overlays/<env>/` / `k8s/base/` | PV is cluster-scoped, so one per env |
 | `app-configmap.yaml` | `k8s/base/app-configmap.yaml` | |
 | `app-secrets.yaml` | `secretGenerator` in `k8s/overlays/<env>/kustomization.yaml` | built from a git-ignored `secrets.env` — see [Task 2](#task-2--kubernetes) |
 | `ingress-dev.yaml` | `k8s/overlays/dev/ingress-dev.yaml` | |
+| `redis-*`, `bullmq-worker-deployment.yaml`, `search-*` | `k8s/base/` | |
 
 ---
 
 ## Task 1 — Docker Compose
 
-`docker compose up --build` starts three containers: `frontend`, `backend` and `postgres`.
+`docker compose up --build` starts seven containers: `frontend`, `backend`, `worker`, `postgres`
+(primary), `postgres-replica`, `redis`, `opensearch`.
 
 **Dockerfiles** (both multi-stage, both run as non-root):
 
@@ -116,13 +120,13 @@ Mapping from the file names suggested in the brief to this repo:
   `npm ci` layer.
 - The build context is the repo root; `.dockerignore` excludes `node_modules`, `.env`, `.git`,
   `k8s/`, docs etc., so they never reach the daemon or an image.
-- The backend image also contains the BullMQ worker entrypoint (`node src/worker.js`); it runs
-  as its own container from Task 5, with the same image: one build, one scan, one version.
+- The backend image is reused for the BullMQ worker (`command: node src/worker.js`): one build,
+  one scan, one version.
 
 **Networking.** Two networks:
 
 - `web`: frontend ↔ backend
-- `data` (`internal: true`): backend ↔ Postgres
+- `data` (`internal: true`): backend/worker ↔ Postgres, replica, Redis, OpenSearch
 
 The frontend container has no route to any datastore. Only the frontend publishes a port.
 Services reach each other by Compose DNS names (`postgres`, `backend`…).
@@ -136,19 +140,18 @@ works in Compose, in Kubernetes and in every environment, with no CORS.
 **Configuration / secrets.** All config is environment variables:
 
 - `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
+- `DB_WRITE_URL`, `DB_READ_URL`, `REDIS_URL`, `SEARCH_URL`
 - `VITE_API_BASE_URL` / `BACKEND_URL` for the frontend
 
 Values come from `.env`, which is git-ignored. `docker-compose.yml` uses `${VAR:?}`, so a
 missing password fails loudly instead of defaulting. The backend has no credential defaults in
 code: `backend/src/config.js` throws on startup if a required variable is missing.
-Redis and search are optional: when `REDIS_URL` / `SEARCH_URL` are unset, the API still
-serves items and reports those services as `disabled` (they are added in Task 5).
 
 **Startup ordering.** Healthchecks plus `depends_on: condition: service_healthy` bring things up
-in order: Postgres → backend → frontend. The backend also retries DB connections
+in order: Postgres → replica → backend → frontend. The backend also retries DB connections
 on its own, because ordering at startup doesn't help when the DB restarts later.
 
-**Persistence.** Named volume `postgres_data`. Verified: items survive
+**Persistence.** Named volumes (`postgres_data`, `postgres_replica_data`, `redis_data`, `search_data`). Verified: items survive
 `docker compose down && docker compose up` (`docker compose down -v` wipes them).
 
 ---
@@ -173,7 +176,10 @@ kubectl get all -n dev
 
 - `backend-service`
 - `frontend-service`
-- `postgres-service`
+- `postgres-service` (writer)
+- `postgres-read-service` (reader)
+- `redis-service`
+- `search-service`
 
 The only way in from outside the cluster is the Ingress controller (Task 3).
 
@@ -256,9 +262,12 @@ Example: `POST http://node-react.local/api/items`
    defines the endpoint set. Only pods passing readiness are included. Any in-cluster client
    (e.g. the frontend's nginx proxy) uses the ClusterIP, which kube-proxy rules (iptables)
    DNAT to one of those pod IPs.
-4. **Pod.** The Express app handles the request and writes with `INSERT … RETURNING` to
-   `postgres-service:5432`.
-5. **PostgreSQL.** `postgres-service` → `postgres-0`, whose data lives on the PersistentVolume.
+4. **Pod.** The Express app handles the request, writes with `INSERT … RETURNING` via
+   `DB_WRITE_URL` = `postgres-service:5432`, and enqueues an `item-created` job in Redis.
+5. **PostgreSQL.** `postgres-service` → `postgres-0` (primary). The change is WAL-streamed to
+   `postgres-replica-0`. Later `GET /api/items` calls are served from the replica via
+   `postgres-read-service`. Asynchronously, the worker consumes the job and indexes the item in
+   OpenSearch.
 
 ### How Kubernetes DNS resolves services
 
@@ -295,6 +304,9 @@ How to read the status code:
 - `502` → the pod is in the endpoint list but refused the connection (wrong port, app crashed)
 - `504` → the app is too slow (often the DB)
 
+Also check whether a NetworkPolicy blocks the controller: `allow-backend` must allow namespace
+`ingress-nginx`.
+
 **(b) The frontend can't talk to the backend:**
 
 1. Browser dev tools → Network. Which URL is called? It must be same-origin `/api/...`.
@@ -309,6 +321,7 @@ How to read the status code:
    `kubectl -n dev exec deploy/frontend -- wget -qO- http://127.0.0.1:8080/api/health`.
    - DNS: `kubectl -n dev exec deploy/backend -- getent hosts backend-service`
    - `BACKEND_URL` env value
+   - NetworkPolicy `allow-backend` allows `app=frontend`
 4. CORS errors only appear if the UI and the API are on different origins. This design avoids
    that entirely.
 
@@ -372,7 +385,7 @@ cluster on a laptop. So the deploy job has two targets:
 - Otherwise it creates an **ephemeral kind cluster on the runner** (same `k8s/kind-config.yaml`,
   same ingress-nginx values). It deploys the freshly pushed GHCR images into the branch's
   namespace and runs an end-to-end smoke test through the Ingress: UI loads, POST an item, GET
-  it back.
+  it back, check DB/replica health.
 
 So every green run proves the images, the manifests, the rollout and the request path. The
 pipeline is unchanged when a real cluster is added. For a real on-prem/laptop cluster, the
@@ -384,7 +397,7 @@ alternatives would be a **self-hosted runner** next to the cluster, or (better) 
 |---|---|---|
 | `GITHUB_TOKEN` | built-in, short-lived, per run | pushing to GHCR (`packages: write` granted only to the build job; every other job has `contents: read`) |
 | `KUBECONFIG_B64` | **Environment** secret (`dev` / `preprod` / `release`) | cluster access; should be a ServiceAccount token whose RBAC is limited to that one namespace |
-| `DB_PASSWORD` | Environment secret | written to the git-ignored `secrets.env` → kustomize `secretGenerator` → k8s Secret |
+| `DB_PASSWORD`, `REPLICATION_PASSWORD`, `REDIS_PASSWORD` | Environment secrets | written to the git-ignored `secrets.env` → kustomize `secretGenerator` → k8s Secret |
 | `GHCR_PULL_TOKEN` (optional) | Environment secret | `read:packages` token for the cluster's image pull secret (GITHUB_TOKEN expires after the job) |
 
 - Each environment has its **own** secrets, so a `master` build can never read production
@@ -417,6 +430,105 @@ Locally: `kubectl -n dev rollout history deploy/backend` and
 
 ---
 
+## Task 5 — Platform services
+
+All of these run in both Compose and Kubernetes, are reachable **only** from the backend tier
+(NetworkPolicies / internal Docker network), and are password-protected where the engine
+supports it in dev mode.
+
+| Service | K8s files | How the app uses it | Health endpoint |
+|---|---|---|---|
+| **Redis 8** | `redis-deployment.yaml`, `redis-service.yaml` | `REDIS_URL` with password (`requirepass`); BullMQ backing store | `/api/health/redis` |
+| **Queue: BullMQ** | `bullmq-worker-deployment.yaml` | `POST /api/items` enqueues `item-created` (5 attempts, exponential backoff); a **separate worker Deployment** (same image, `node src/worker.js`) consumes it | worker probe `:4001` |
+| **Search: OpenSearch 2.19** (single node, dev mode) | `search-deployment.yaml`, `search-service.yaml` | the worker indexes each new item; `GET /api/search?q=` does a fuzzy match (UI search box) | `/api/health/search` |
+| **Postgres read replica** | `postgres-replica-statefulset.yaml`, `postgres-read-service.yaml` | `DB_READ_URL` | `/api/health/db` |
+
+The queue does real work instead of just logging:
+
+- **Indexing is asynchronous.** A slow or down OpenSearch never slows down or fails a write;
+  jobs retry with backoff until search is back.
+- **The worker scales and fails independently** of the API. The next step would be autoscaling
+  it on queue depth with KEDA.
+
+### Isolation: platform services stay internal
+
+All Services are `ClusterIP`, and inside the namespace a **default-deny NetworkPolicy** plus
+explicit allow rules (`k8s/base/networkpolicies.yaml`) enforce who can talk to whom:
+
+| To ↓ / allowed from → | ingress-nginx | frontend | backend | worker |
+|---|---|---|---|---|
+| frontend :8080 | ✅ | | | |
+| backend :4000 | ✅ | ✅ (nginx proxy) | | |
+| postgres / replica :5432 | | | ✅ | ✅ |
+| redis :6379 | | | ✅ | ✅ |
+| opensearch :9200 | | | ✅ | ✅ |
+
+Verified on kind (kindnet enforces NetworkPolicy):
+
+- frontend → postgres: **timeout**
+- frontend → redis: **timeout**
+- pod in `default` namespace → backend: **timeout**
+- backend → postgres: **connected**
+
+In Compose the same idea is the `internal: true` `data` network, which the frontend isn't on.
+
+### Read/write DB cluster
+
+This is a **real** streaming-replication pair rather than two URLs pointing at one database:
+
+- `postgres` (primary) runs an init script that creates a `replicator` role and a `pg_hba`
+  rule.
+- `postgres-replica` clones it with `pg_basebackup -R` on first start, then runs as a read-only
+  hot standby following the primary's WAL. Its storage comes from `volumeClaimTemplates` with
+  the default StorageClass (dynamic provisioning, next to the primary's static PV).
+- The same two scripts (`k8s/base/postgres-scripts/`) are used by Compose and Kubernetes.
+
+```
+DB_WRITE_URL = postgres://appuser:***@postgres-service:5432/appdb       (primary)
+DB_READ_URL  = postgres://appuser:***@postgres-read-service:5432/appdb  (replica)
+```
+
+Passwords are not stored in the ConfigMap. The URLs are composed in the pod spec from
+ConfigMap values plus Secret refs (`$(DB_PASSWORD)` expansion).
+
+`GET /api/health/db` → `{"primary":"ok","read_target_is_replica":true,"replication_lag_seconds":…}`
+proves reads really hit a standby (`pg_is_in_recovery()`). The lag value is
+`now() - pg_last_xact_replay_timestamp()`. That's accurate under write load, but it grows while
+the primary is idle, so in production compare LSNs from `pg_stat_replication` instead.
+
+**Where the routing logic lives.** Here it's **in application code** (`backend/src/db.js`): two
+pools, and every call site chooses `db.write()` or `db.read()`. If the replica is unreachable,
+reads fall back to the primary (more load on the writer beats failing requests).
+
+| Option | Pros | Cons |
+|---|---|---|
+| **App code** (this repo) | explicit, per-query control (read-your-writes), no extra hop | every developer must choose correctly; logic duplicated per service/language |
+| **DB proxy** (Pgpool-II, ProxySQL-style, PgCat, AWS RDS Proxy reader endpoints) | transparent to the app, central policy, connection pooling | another component to run/HA; can't know which reads need fresh data, so it routes per transaction/statement type, not intent |
+| **Managed endpoints** (RDS/Aurora writer + reader endpoints, Cloud SQL replicas) | no proxy to run | still two URLs, so the app still chooses |
+
+A pragmatic production setup is app-level choice of writer vs reader, plus PgBouncer per pool
+for connection limits.
+
+**What replication lag implies.** A replica is asynchronously behind the primary, usually
+milliseconds, but seconds or more under heavy writes, vacuum, or a network blip. So a read from
+the replica can be *stale*. Operations that must always hit the **writer**:
+
+- all writes (`INSERT/UPDATE/DELETE`, DDL, migrations) — a replica is read-only anyway
+- **read-your-own-writes**: showing the user what they just saved. The UI here deliberately uses
+  the row returned by `INSERT … RETURNING` (from the primary) instead of re-reading the list from
+  the replica, where the new item might not exist yet.
+- reads inside a transaction that then writes, and check-then-act logic (uniqueness checks,
+  balances/stock, idempotency keys, "does this user exist" before creating one)
+- authentication/authorization data right after it changes (password reset, revoked
+  permissions, logout)
+- anything feeding a decision that must be consistent (payments, inventory)
+
+Safe for the replica: lists, search pages, dashboards, reports, anything where a few seconds of
+staleness is acceptable. A common refinement is "sticky primary": route a user's reads to the
+writer for N seconds after they write.
+
+---
+
 ## Design decisions & trade-offs
 
 | Decision | Why | Trade-off |
@@ -430,6 +542,10 @@ Locally: `kubectl -n dev rollout history deploy/backend` and
 | **Helm for third-party, kustomize for our app** | upstream charts are maintained by their authors; our app is simple enough for plain YAML | two tools |
 | **ingress-nginx** | suggested by the brief, mature, simple annotations | project retired in 2026; Gateway API is the forward path |
 | **Ephemeral kind in CI** | the only way to get a real deploy + smoke test from GitHub-hosted runners for a local-only brief | doesn't deploy to *your* laptop cluster; a real cluster just needs `KUBECONFIG_B64` |
+| **Real streaming replica** instead of two URLs to one DB | shows the read/write split and lag behaviour for real (`pg_is_in_recovery() = true`) | more moving parts; failover is manual (no Patroni) |
+| **Async indexing via BullMQ** | writes never depend on search availability | search is eventually consistent (ms–s behind) |
+| **OpenSearch / Redis on emptyDir** | dev mode; the search index is derived data rebuildable from Postgres | Redis queue contents are lost if the pod is deleted (AOF survives container restarts only) |
+| **Security plugin disabled on OpenSearch** | dev mode, as the brief allows | only acceptable because NetworkPolicies restrict it to the backend tier |
 
 ## Roadmap
 
@@ -439,5 +555,5 @@ Locally: `kubectl -n dev rollout history deploy/backend` and
 | 2. Kubernetes (dev namespace) | ✅ done |
 | 3. Ingress / API gateway + Terraform | ✅ done |
 | 4. CI/CD & multi-environment deployment | ✅ done |
-| 5. Redis, queue, search, read/write DB | planned |
+| 5. Redis, queue, search, read/write DB | ✅ done |
 | 6. Observability, autoscaling, rate limiting | planned |

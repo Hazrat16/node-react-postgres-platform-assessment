@@ -2,29 +2,103 @@
 #
 # Networks:
 #   web  - frontend <-> backend
-#   data - backend <-> postgres
+#   data - backend/worker <-> postgres, replica, redis, opensearch
 #          (internal: no route to the outside world, and the frontend
-#           container has no path to the database at all)
+#           container has no path to the databases at all)
 #
 # Only the frontend publishes a host port; the backend is bound to 127.0.0.1
-# for debugging with curl. The database is not published.
+# for debugging with curl. Datastores are not published.
 
 name: node-react-platform
+
+x-backend-env: &backend-env
+  DB_HOST: postgres
+  DB_PORT: ${DB_PORT:-5432}
+  DB_USER: ${DB_USER:?set DB_USER in .env}
+  DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+  DB_NAME: ${DB_NAME:?set DB_NAME in .env}
+  # Read/write split: writes -> primary, reads -> streaming replica
+  DB_WRITE_URL: postgres://${DB_USER}:${DB_PASSWORD}@postgres:${DB_PORT:-5432}/${DB_NAME}
+  DB_READ_URL: postgres://${DB_USER}:${DB_PASSWORD}@postgres-replica:${DB_PORT:-5432}/${DB_NAME}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+  SEARCH_URL: http://opensearch:9200
 
 services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: ${DB_USER:?set DB_USER in .env}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-      POSTGRES_DB: ${DB_NAME:?set DB_NAME in .env}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?set REPLICATION_PASSWORD in .env}
+    # Keep enough WAL around for the replica to catch up after a restart.
+    command: ["postgres", "-c", "wal_keep_size=256MB"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Same script Kubernetes mounts from a ConfigMap (kept under k8s/base so
+      # kustomize can generate the ConfigMap from it).
+      - ./k8s/base/postgres-scripts/primary-init.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 10
+    networks: [data]
+    restart: unless-stopped
+
+  postgres-replica:
+    image: postgres:17-alpine
+    environment:
+      PRIMARY_HOST: postgres
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD}
+    entrypoint: ["sh", "/scripts/replica-entrypoint.sh"]
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./k8s/base/postgres-scripts/replica-entrypoint.sh:/scripts/replica-entrypoint.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [data]
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD} # used by redis-cli in the healthcheck
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [data]
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.6
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true" # dev mode: reachable only on the internal network
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+      # Single-node dev: don't flip indices to read-only when the laptop disk is >95% full.
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    volumes:
+      - search_data:/usr/share/opensearch/data
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
     networks: [data]
     restart: unless-stopped
 
@@ -34,16 +108,16 @@ services:
       dockerfile: Dockerfile.backend
     image: node-react-backend:local
     environment:
-      DB_HOST: postgres
-      DB_PORT: ${DB_PORT:-5432}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      DB_NAME: ${DB_NAME}
+      <<: *backend-env
       PORT: 4000
     ports:
       - "127.0.0.1:4000:4000"
     depends_on:
       postgres:
+        condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/api/health/ready"]
@@ -51,6 +125,22 @@ services:
       timeout: 3s
       retries: 5
     networks: [web, data]
+    restart: unless-stopped
+
+  worker:
+    image: node-react-backend:local # same image as the API, different command
+    command: ["node", "src/worker.js"]
+    environment:
+      <<: *backend-env
+      SERVICE_NAME: worker
+    depends_on:
+      backend: # ensures the image is built first
+        condition: service_started
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    networks: [data]
     restart: unless-stopped
 
   frontend:
@@ -82,3 +172,6 @@ networks:
 
 volumes:
   postgres_data:
+  postgres_replica_data:
+  redis_data:
+  search_data:

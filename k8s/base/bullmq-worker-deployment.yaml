@@ -1,0 +1,79 @@
+# BullMQ worker: same image as the API, different entrypoint. Consumes
+# "item-created" jobs from Redis and indexes items into OpenSearch.
+# Separate Deployment = scales and fails independently of the API.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bullmq-worker
+  labels:
+    app: bullmq-worker
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: bullmq-worker
+  template:
+    metadata:
+      labels:
+        app: bullmq-worker
+        tier: worker
+    spec:
+      terminationGracePeriodSeconds: 30 # lets the current job finish
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: node-react-backend
+          imagePullPolicy: IfNotPresent
+          command: ["node", "src/worker.js"]
+          ports:
+            - name: health
+              containerPort: 4001
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: SERVICE_NAME
+              value: worker
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: DB_PASSWORD
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: REDIS_PASSWORD
+            - name: DB_WRITE_URL
+              value: postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)
+            - name: REDIS_URL
+              value: redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):6379
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 250m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
