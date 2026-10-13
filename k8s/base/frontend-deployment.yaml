@@ -35,7 +35,8 @@ spec:
             - name: http
               containerPort: 8080
           env:
-            # The frontend's nginx proxies /api here (same-origin for the browser).
+            # Only used when the UI is reached without the Ingress; with the
+            # Ingress, /api goes straight to backend-service.
             - name: BACKEND_URL
               value: http://backend-service:4000
           readinessProbe:

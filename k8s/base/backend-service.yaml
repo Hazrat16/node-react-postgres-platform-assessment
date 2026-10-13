@@ -1,6 +1,6 @@
 # Internal only: reachable inside the cluster as
-# backend-service.<namespace>.svc.cluster.local. External traffic only reaches
-# it through the frontend's nginx proxy, never directly.
+# backend-service.<namespace>.svc.cluster.local. External traffic arrives via
+# the Ingress, never directly.
 apiVersion: v1
 kind: Service
 metadata:
